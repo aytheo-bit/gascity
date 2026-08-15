@@ -1113,6 +1113,31 @@ func managedCityForcedStopTimeout(mc *managedCity) time.Duration {
 	return timeout * 5
 }
 
+// runCityShutdownBounded runs mc.cr.shutdown() in its own goroutine and waits
+// for it to finish, bounded by the forced-stop timeout (or mc.done closing
+// first). shutdown() is idempotent (guarded by sync.Once), so if it is
+// genuinely hung — e.g. on a beads/session call with no context of its own —
+// abandoning the goroutine past the bound is safe: it either completes later
+// on its own or blocks harmlessly forever without doing further work. This
+// keeps a hung shutdown() from blocking the caller's own bounded wait for
+// mc.done (#5256).
+func runCityShutdownBounded(mc *managedCity) {
+	if mc == nil || mc.cr == nil {
+		return
+	}
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer func() { recover() }() //nolint:errcheck
+		defer close(shutdownDone)
+		mc.cr.shutdown()
+	}()
+	select {
+	case <-shutdownDone:
+	case <-mc.done:
+	case <-time.After(managedCityForcedStopTimeout(mc)):
+	}
+}
+
 // stopManagedCity cancels a city's context, waits up to its configured
 // grace period for it to exit, forces shutdown if it doesn't, and then
 // closes the bead provider and file recorder. It returns a non-nil error
@@ -1145,10 +1170,7 @@ func stopManagedCity(mc *managedCity, cityPath string, stderr io.Writer) error {
 		if mc.cr.forceStopShutdown != nil {
 			mc.cr.forceStopShutdown.Store(true)
 		}
-		func() {
-			defer func() { recover() }() //nolint:errcheck
-			mc.cr.shutdown()
-		}()
+		runCityShutdownBounded(mc)
 	}
 	forceTimeout := managedCityForcedStopTimeout(mc)
 	if forceTimeout > 0 {
@@ -1192,10 +1214,7 @@ func stopManagedCityPreservingSessions(mc *managedCity, _ string, stderr io.Writ
 		}
 	}
 	if waitForRuntimeShutdown && mc.cr != nil {
-		func() {
-			defer func() { recover() }() //nolint:errcheck
-			mc.cr.shutdown()
-		}()
+		runCityShutdownBounded(mc)
 		if timeout > 0 {
 			select {
 			case <-mc.done:
