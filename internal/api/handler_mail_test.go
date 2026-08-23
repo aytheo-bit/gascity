@@ -1291,6 +1291,90 @@ func TestMailSendNotifyToRecipientWithNoLiveSessionIsNoop(t *testing.T) {
 	}
 }
 
+// TestMailSendNotifyDoesNotCollideWithAnUnrelatedSessionSharingTheAliasString
+// is planted proof for a real gap found by independent review: the persisted
+// recipient address prefers an alias over a bead ID (session.MailboxAddress),
+// but re-resolving that same address string later as a worker target
+// (workerHandleForSessionTarget) gives an EXACT session-ID match priority
+// over alias resolution. If recipient A's alias happened to equal unrelated
+// live session B's raw bead ID, notifying via the persisted address alone
+// would resolve straight to B and nudge the wrong session. The fix threads
+// the session ID resolveMailSendRecipientWithContext already resolved
+// straight through to notify, instead of re-deriving it from msg.To.
+func TestMailSendNotifyDoesNotCollideWithAnUnrelatedSessionSharingTheAliasString(t *testing.T) {
+	fs := newSessionFakeState(t)
+	bystander := createTestSession(t, fs.cityBeadStore, fs.sp, "Bystander")
+	// createTestSession's runtime name is an implementation detail (this
+	// suite's fake provider does not use the bead ID verbatim) -- capture it
+	// from the recorded Start call instead of assuming a naming convention,
+	// so this test can't silently pass vacuously the way an earlier draft
+	// did by asserting against the wrong name string.
+	bystanderRuntimeName := lastStartCallName(t, fs.sp)
+	target := createTestSession(t, fs.cityBeadStore, fs.sp, "Notify Target")
+	targetRuntimeName := lastStartCallName(t, fs.sp)
+	if bystanderRuntimeName == targetRuntimeName {
+		t.Fatalf("test setup: bystander and target got the same runtime name %q", bystanderRuntimeName)
+	}
+
+	// Construct the collision: target's alias is literally bystander's own
+	// bead ID -- an adversarial-looking setup, but the point is that nothing
+	// prevents a human-chosen alias from coinciding with another session's
+	// opaque generated ID; the resolution logic must not assume it can't.
+	bead, err := fs.cityBeadStore.Get(target.ID)
+	if err != nil {
+		t.Fatalf("get target bead: %v", err)
+	}
+	metadata := map[string]string{"alias": bystander.ID}
+	for k, v := range bead.Metadata {
+		metadata[k] = v
+	}
+	if err := fs.cityBeadStore.Update(target.ID, beads.UpdateOpts{Metadata: metadata}); err != nil {
+		t.Fatalf("set colliding alias: %v", err)
+	}
+
+	h := newTestCityHandler(t, fs)
+	body := fmt.Sprintf(`{"from":"mayor","to":%q,"subject":"Ping","body":"hello","notify":true}`, target.ID)
+	req := newPostRequest(cityURL(fs, "/mail"), bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("send status = %d, want %d, body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var sent mail.Message
+	json.NewDecoder(rec.Body).Decode(&sent) //nolint:errcheck
+	if sent.To != bystander.ID {
+		t.Fatalf("persisted To = %q, want %q (the alias, per session.MailboxAddress -- this is expected, not the bug)", sent.To, bystander.ID)
+	}
+
+	nudges := nudgeCallsTo(fs.sp)
+	if len(nudges) != 1 {
+		t.Fatalf("Nudge calls = %d, want exactly 1; all calls: %+v", len(nudges), fs.sp.SnapshotCalls())
+	}
+	if nudges[0].Name != targetRuntimeName {
+		t.Fatalf("nudge landed on runtime %q, want target's runtime %q (bystander's runtime is %q) -- wrong session was notified",
+			nudges[0].Name, targetRuntimeName, bystanderRuntimeName)
+	}
+	if got := fs.sp.CountCalls("Nudge", bystanderRuntimeName); got != 0 {
+		t.Fatalf("bystander (unrelated session whose ID collided with target's alias) received %d nudge(s), want 0", got)
+	}
+}
+
+// lastStartCallName returns the session name from the most recently recorded
+// Start call, for tests that need to know a fake session's actual runtime
+// name without hardcoding this suite's naming convention.
+func lastStartCallName(t *testing.T, sp *runtime.Fake) string {
+	t.Helper()
+	calls := sp.SnapshotCalls()
+	for i := len(calls) - 1; i >= 0; i-- {
+		if calls[i].Method == "Start" {
+			return calls[i].Name
+		}
+	}
+	t.Fatal("no Start call recorded")
+	return ""
+}
+
 // TestMailReplyNotifyNudgesLiveRecipientSession covers the exact incident
 // shape: a human replies (via the dashboard, which only ever calls the HTTP
 // API) to a message from a live orchestrator session; notify:true must wake

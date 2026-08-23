@@ -380,7 +380,7 @@ func (s *Server) humaHandleMailGet(ctx context.Context, input *MailGetInput) (*I
 // Body validation (To and Subject required, minLength:"1") is enforced by
 // the framework from MailSendInput's struct tags.
 func (s *Server) humaHandleMailSend(ctx context.Context, input *MailSendInput) (*IndexOutput[mail.Message], error) {
-	resolved, resolveErr := s.resolveMailSendRecipientWithContext(ctx, input.Body.To)
+	resolved, resolvedSessionID, resolveErr := s.resolveMailSendRecipientWithContext(ctx, input.Body.To)
 	if resolveErr != nil {
 		if errors.Is(resolveErr, errMailNoBeadStore) {
 			return nil, apierr.InvalidRequest.Msg(resolveErr.Error())
@@ -412,13 +412,23 @@ func (s *Server) humaHandleMailSend(ctx context.Context, input *MailSendInput) (
 	}
 
 	if input.Body.Notify {
-		s.notifyMailRecipient(ctx, msg.To, msg.From)
+		// resolvedSessionID, not msg.To: see resolveMailSendRecipientWithContext's
+		// doc comment for why re-resolving the persisted address string here
+		// instead would risk nudging an unrelated session.
+		s.notifyMailRecipient(ctx, firstNonEmptyMailTarget(resolvedSessionID, msg.To), msg.From)
 	}
 
 	return &IndexOutput[mail.Message]{
 		Index: s.latestIndex(),
 		Body:  msg,
 	}, nil
+}
+
+func firstNonEmptyMailTarget(sessionID, address string) string {
+	if sessionID != "" {
+		return sessionID
+	}
+	return address
 }
 
 // notifyMailRecipient best-effort nudges a mail recipient's live session so a
