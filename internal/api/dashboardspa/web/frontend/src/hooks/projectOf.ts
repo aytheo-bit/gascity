@@ -70,9 +70,21 @@ const ORCHESTRATION_TEMPLATES: ReadonlySet<string> = new Set([
   'oversight-rig.chief-of-staff',
 ]);
 
+// A tier-numbered orchestrator template (e.g. `tier0-a2-dictionary`,
+// `tier1-linear-closeout`). Unlike the closed ORCHESTRATION_TEMPLATES set,
+// this role class is intentionally open-ended: an operator names a fresh
+// Tier 0/1/2 charter per lane/gate, so a fixed enumerable set would need a
+// frontend rebuild+redeploy every time a new one is spawned (confirmed gap —
+// a genuine custom charter never showed as orchestration in prior builds).
+// Anchored to the start and requires a hyphen after the tier number, so it
+// cannot loosely match an unrelated rig/pool name that merely contains
+// "tier" as a substring.
+const TIER_ORCHESTRATION_RX = /^tier[0-9]+-/;
+
 export function isOrchestrationSession(s: DashboardSession): boolean {
   if (s.rig && s.rig.length > 0) return false;
-  return !!s.template && ORCHESTRATION_TEMPLATES.has(s.template);
+  if (!s.template) return false;
+  return ORCHESTRATION_TEMPLATES.has(s.template) || TIER_ORCHESTRATION_RX.test(s.template);
 }
 
 // A session is a per-rig dispatcher when it's scoped to a rig but
@@ -197,7 +209,8 @@ const MAINTENANCE_POOLS: ReadonlySet<string> = new Set(['dog']);
 
 export function isOrchestrationAgent(a: AgentResponse): boolean {
   if (a.rig && a.rig.length > 0) return false;
-  return ORCHESTRATION_AGENT_NAMES.has(a.name);
+  if (!a.name) return false;
+  return ORCHESTRATION_AGENT_NAMES.has(a.name) || TIER_ORCHESTRATION_RX.test(a.name);
 }
 
 /**

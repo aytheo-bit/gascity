@@ -331,10 +331,14 @@ describe('AgentsPage (post-ay6 regressions)', () => {
       </MemoryRouter>,
     );
 
-    // Wait for the row to load.
-    await screen.findByRole('link', { name: /mayor/i });
+    // mayor now also appears in the "Orchestrators active" section (a real,
+    // separate row with its own Peek button — the missing-orchestrator-
+    // visibility fix), so scope this to the "Available agents" roster table,
+    // same pattern as the roster-row tooltip test above.
+    const roster = within(await screen.findByRole('table'));
+    await roster.findByRole('link', { name: /mayor/i });
 
-    const peekButton = await screen.findByRole('button', { name: /peek/i });
+    const peekButton = await roster.findByRole('button', { name: /peek/i });
     fireEvent.click(peekButton);
 
     // The peek modal must hit supervisor transcript for gc-2568 — NOT
