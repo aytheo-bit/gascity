@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"strings"
 	"time"
@@ -11,7 +12,9 @@ import (
 	"github.com/gastownhall/gascity/internal/api/apierr"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/telemetry"
+	"github.com/gastownhall/gascity/internal/worker"
 )
 
 // mailReadDeadline is shorter than the API client's 10s timeout so typed
@@ -408,10 +411,56 @@ func (s *Server) humaHandleMailSend(ctx context.Context, input *MailSendInput) (
 		return nil, err
 	}
 
+	if input.Body.Notify {
+		s.notifyMailRecipient(ctx, msg.To, msg.From)
+	}
+
 	return &IndexOutput[mail.Message]{
 		Index: s.latestIndex(),
 		Body:  msg,
 	}, nil
+}
+
+// notifyMailRecipient best-effort nudges a mail recipient's live session so a
+// send/reply does not sit unread and un-actioned -- the HTTP-API counterpart
+// to `gc mail send/reply --notify` (the dashboard, unlike the CLI, has no
+// other way to trigger this). Wires to the exact same worker.Handle.Nudge
+// primitive the CLI's --notify uses (cmd/gc/cmd_nudge.go's
+// sendMailNotifyWithWorker), via the API-side resolution path
+// workerHandleForSessionTarget already established for /submit and
+// /messages.
+//
+// Deliberately fail-open and live-only, matching the CLI's own semantics: a
+// recipient with no live, nudgeable session -- a human mailbox, an alias
+// with no running worker, a suspended session -- is not an error, since the
+// message was already sent/replied; only the wake is best-effort. Wake:
+// NudgeWakeLiveOnly means this never cold-starts a stopped session (unlike
+// the CLI path's managed-wake fallback for a configured-but-not-running
+// target) -- a Notify flag flipped on by default in a UI must not carry the
+// side effect of spinning up new agent processes.
+func (s *Server) notifyMailRecipient(ctx context.Context, recipient, sender string) {
+	recipient = strings.TrimSpace(recipient)
+	if recipient == "" || recipient == "human" {
+		return
+	}
+	store := s.state.SessionsBeadStore()
+	if store.Store == nil {
+		return
+	}
+	handle, err := s.workerHandleForSessionTarget(store.Store, recipient)
+	if err != nil {
+		if !errors.Is(err, session.ErrSessionNotFound) {
+			log.Printf("api: mail notify: resolving worker handle for %q: %v", recipient, err)
+		}
+		return
+	}
+	if _, err := handle.Nudge(ctx, worker.NudgeRequest{
+		Text:   fmt.Sprintf("You have mail from %s", sender),
+		Source: "mail",
+		Wake:   worker.NudgeWakeLiveOnly,
+	}); err != nil {
+		log.Printf("api: mail notify: nudging %q: %v", recipient, err)
+	}
 }
 
 // humaHandleMailCount is the Huma-typed handler for GET /v0/mail/count.
@@ -671,6 +720,10 @@ func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput)
 		})
 	if err != nil {
 		return nil, err
+	}
+
+	if input.Body.Notify {
+		s.notifyMailRecipient(ctx, msg.To, msg.From)
 	}
 
 	return &IndexOutput[mail.Message]{

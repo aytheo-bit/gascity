@@ -1756,6 +1756,10 @@ export type MailReplyInputBody = {
      */
     from?: string;
     /**
+     * Best-effort nudge the recipient's live session after replying, mirroring 'gc mail reply --notify'. No-op if the recipient has no live, nudgeable session -- never fails the reply.
+     */
+    notify?: boolean;
+    /**
      * Reply subject.
      */
     subject?: string;
@@ -1770,6 +1774,10 @@ export type MailSendInputBody = {
      * Sender name.
      */
     from?: string;
+    /**
+     * Best-effort nudge the recipient's live session after sending, mirroring 'gc mail send --notify'. No-op if the recipient has no live, nudgeable session -- never fails the send.
+     */
+    notify?: boolean;
     /**
      * Rig name.
      */

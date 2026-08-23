@@ -16,6 +16,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 )
 
@@ -1215,6 +1216,126 @@ func TestMailReply(t *testing.T) {
 	if reply.ThreadID == "" {
 		t.Error("reply has no ThreadID")
 	}
+}
+
+// TestMailSendNotifyNudgesLiveRecipientSession is planted proof for the
+// dashboard-reply-never-wakes-anyone gap: a dashboard mail send/reply had no
+// way to trigger the same wake the CLI's `gc mail send/reply --notify`
+// already does, so a message could sit unread indefinitely even though the
+// recipient session was live and idle (see docs/CLAUDE.md's "Dashboard
+// replies don't wake anyone" incident). notify:true must reach the
+// recipient's live runtime via a real Nudge call, not merely persist the
+// message.
+func TestMailSendNotifyNudgesLiveRecipientSession(t *testing.T) {
+	fs := newSessionFakeState(t)
+	target := createTestSession(t, fs.cityBeadStore, fs.sp, "Notify Target")
+	h := newTestCityHandler(t, fs)
+
+	body := fmt.Sprintf(`{"from":"mayor","to":%q,"subject":"Ping","body":"hello","notify":true}`, target.ID)
+	req := newPostRequest(cityURL(fs, "/mail"), bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("send status = %d, want %d, body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	nudges := nudgeCallsTo(fs.sp)
+	if len(nudges) != 1 {
+		t.Fatalf("Nudge calls = %d, want 1; all calls: %+v", len(nudges), fs.sp.SnapshotCalls())
+	}
+	if !strings.Contains(nudges[0].Message, "mayor") {
+		t.Errorf("nudge message = %q, want it to mention the sender %q", nudges[0].Message, "mayor")
+	}
+}
+
+// TestMailSendWithoutNotifyDoesNotNudge is the negative twin: notify absent
+// (the CLI's own default) must not nudge, so the flag actually gates the
+// behavior rather than nudging unconditionally.
+func TestMailSendWithoutNotifyDoesNotNudge(t *testing.T) {
+	fs := newSessionFakeState(t)
+	target := createTestSession(t, fs.cityBeadStore, fs.sp, "Notify Target")
+	h := newTestCityHandler(t, fs)
+
+	body := fmt.Sprintf(`{"from":"mayor","to":%q,"subject":"Ping","body":"hello"}`, target.ID)
+	req := newPostRequest(cityURL(fs, "/mail"), bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("send status = %d, want %d, body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	if nudges := nudgeCallsTo(fs.sp); len(nudges) != 0 {
+		t.Fatalf("Nudge calls = %d, want 0 (notify was not set): %+v", len(nudges), nudges)
+	}
+}
+
+// TestMailSendNotifyToRecipientWithNoLiveSessionIsNoop covers the CLI's own
+// fail-open behavior: a recipient with nothing live to nudge (never
+// materialized, already stopped) must not fail the send -- the message was
+// already persisted; only the wake is best-effort.
+func TestMailSendNotifyToRecipientWithNoLiveSessionIsNoop(t *testing.T) {
+	fs := newSessionFakeState(t)
+	h := newTestCityHandler(t, fs)
+
+	body := `{"from":"mayor","to":"worker","subject":"Ping","body":"hello","notify":true}`
+	req := newPostRequest(cityURL(fs, "/mail"), bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("send status = %d, want %d, body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	if nudges := nudgeCallsTo(fs.sp); len(nudges) != 0 {
+		t.Fatalf("Nudge calls = %d, want 0 (no live session to nudge): %+v", len(nudges), nudges)
+	}
+}
+
+// TestMailReplyNotifyNudgesLiveRecipientSession covers the exact incident
+// shape: a human replies (via the dashboard, which only ever calls the HTTP
+// API) to a message from a live orchestrator session; notify:true must wake
+// that session the same way `gc mail reply --notify` would from the CLI.
+func TestMailReplyNotifyNudgesLiveRecipientSession(t *testing.T) {
+	fs := newSessionFakeState(t)
+	orchestrator := createTestSession(t, fs.cityBeadStore, fs.sp, "Tier 0")
+	mp := fs.cityMailProv
+	// Reply direction is original.From -> reply.To, so seed the original
+	// message FROM the live session's own address -- exactly the shape of a
+	// question mailed out by an orchestrator, later answered by a human.
+	original, err := mp.Send(orchestrator.ID, "human", "Q1/Q2/Q3", "charter now or hold?")
+	if err != nil {
+		t.Fatalf("seed original message: %v", err)
+	}
+	h := newTestCityHandler(t, fs)
+
+	body := `{"from":"human","subject":"Re: Q1/Q2/Q3","body":"Q1 - A","notify":true}`
+	req := newPostRequest(cityURL(fs, "/mail/")+original.ID+"/reply", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("reply status = %d, want %d, body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	nudges := nudgeCallsTo(fs.sp)
+	if len(nudges) != 1 {
+		t.Fatalf("Nudge calls = %d, want 1; all calls: %+v", len(nudges), fs.sp.SnapshotCalls())
+	}
+	if !strings.Contains(nudges[0].Message, "human") {
+		t.Errorf("nudge message = %q, want it to mention the sender %q", nudges[0].Message, "human")
+	}
+}
+
+// nudgeCallsTo filters a fake runtime provider's recorded calls down to
+// Nudge invocations, the shape every test above asserts on.
+func nudgeCallsTo(sp *runtime.Fake) []runtime.Call {
+	var out []runtime.Call
+	for _, call := range sp.SnapshotCalls() {
+		if call.Method == "Nudge" {
+			out = append(out, call)
+		}
+	}
+	return out
 }
 
 func TestMailListIncludesRig(t *testing.T) {

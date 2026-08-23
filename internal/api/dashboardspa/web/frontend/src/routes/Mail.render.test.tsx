@@ -475,12 +475,17 @@ describe('MailPage supervisor reads', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Reply' }));
 
     await waitFor(() => {
+      // notify: true is replySupervisorMail's own default (mailWrites.ts) —
+      // a reply through the dashboard must wake the recipient's live
+      // session, not just persist as another unread bead nobody is told
+      // about (see "Dashboard replies don't wake anyone").
       expect(fetchCalls).toContainEqual({
         method: 'POST',
         url: '/v0/city/test-city/mail/mail-inbox/reply',
         body: {
           body: 'got it',
           from: 'human',
+          notify: true,
         },
         gcRequest: 'dashboard',
       });

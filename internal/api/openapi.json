@@ -4369,6 +4369,10 @@
             "description": "Sender name.",
             "type": "string"
           },
+          "notify": {
+            "description": "Best-effort nudge the recipient's live session after replying, mirroring 'gc mail reply --notify'. No-op if the recipient has no live, nudgeable session -- never fails the reply.",
+            "type": "boolean"
+          },
           "subject": {
             "description": "Reply subject.",
             "type": "string"
@@ -4386,6 +4390,10 @@
           "from": {
             "description": "Sender name.",
             "type": "string"
+          },
+          "notify": {
+            "description": "Best-effort nudge the recipient's live session after sending, mirroring 'gc mail send --notify'. No-op if the recipient has no live, nudgeable session -- never fails the send.",
+            "type": "boolean"
           },
           "rig": {
             "description": "Rig name.",

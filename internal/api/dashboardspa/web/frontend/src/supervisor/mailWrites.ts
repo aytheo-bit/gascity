@@ -5,10 +5,25 @@ export interface MailComposeDraft {
   to: string;
   subject: string;
   body: string;
+  // Best-effort nudge the recipient's live session after sending, mirroring
+  // `gc mail send --notify`. Optional and unset by default for a fresh
+  // compose (matching the CLI's own opt-in default) -- see MailReplyDraft's
+  // notify for why a REPLY defaults the opposite way.
+  notify?: boolean;
 }
 
 export interface MailReplyDraft {
   body: string;
+  // Defaults to true in replySupervisorMail below. Unlike a fresh compose,
+  // a reply through the dashboard was — until this field existed — the
+  // ONLY way to answer a session's mail with no way to wake it: the reply
+  // persisted as an unread bead and nothing else, so the recipient could
+  // sit idle indefinitely unaware an answer had arrived (see "Dashboard
+  // replies don't wake anyone" in the project's own incident record). A
+  // reply is, by definition, answering something the recipient is already
+  // waiting on -- silently not-notifying should be the deliberate
+  // exception, not the default.
+  notify?: boolean;
 }
 
 export interface MailActionTarget {
@@ -59,6 +74,7 @@ export async function replySupervisorMail(
     activeCityOrThrow('reply supervisor mail'),
     message.id,
     {
+      notify: true,
       ...draft,
       from: operatorWireAlias,
     },
