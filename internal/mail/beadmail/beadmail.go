@@ -266,8 +266,6 @@ func (p *Provider) InboxRecipients(recipients []string) ([]mail.Message, error) 
 	return p.filterMessagesForRecipients(recipients, false)
 }
 
-// Get retrieves a message by ID without marking it read.
-// Returns an error if the bead is not a message type.
 // ResolvedRecipientSessionID implements [mail.ResolvedRecipientProvider].
 // The stored Assignee already carries beadmail's own exact-session-ID
 // preference -- for a Reply specifically, that's toSessionID (read from the
@@ -282,6 +280,8 @@ func (p *Provider) ResolvedRecipientSessionID(id string) (string, error) {
 	return strings.TrimSpace(b.Assignee), nil
 }
 
+// Get retrieves a message by ID without marking it read.
+// Returns an error if the bead is not a message type.
 func (p *Provider) Get(id string) (mail.Message, error) {
 	b, err := p.store.Get(id)
 	if err != nil {
