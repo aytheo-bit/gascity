@@ -733,13 +733,42 @@ func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput)
 	}
 
 	if input.Body.Notify {
-		s.notifyMailRecipient(ctx, msg.To, msg.From)
+		// The provider lookup is repeated here (cheap, side-effect-free)
+		// rather than threaded out of the closure above, since that closure
+		// is SKIPPED entirely on an idempotent replay -- msg is still valid
+		// then, but nothing captured inside the closure is. See
+		// replyNotifyTarget's doc comment for why msg.To alone isn't safe.
+		target := msg.To
+		if mp, _, mpErr := s.findMailProviderForMessage(msg.ID, msg.Rig); mpErr == nil && mp != nil {
+			target = replyNotifyTarget(mp, msg)
+		}
+		s.notifyMailRecipient(ctx, target, msg.From)
 	}
 
 	return &IndexOutput[mail.Message]{
 		Index: s.latestIndex(),
 		Body:  msg,
 	}, nil
+}
+
+// replyNotifyTarget prefers a provider's exact resolved session ID for a
+// reply over msg.To (which prefers a display alias -- see beadToMessage).
+// The same collision risk fixed for Send applies here: re-resolving a
+// display alias as a worker target through a second, differently-prioritized
+// lookup could nudge an unrelated session whose raw ID happens to equal that
+// alias. Falls back to msg.To when the provider doesn't implement
+// mail.ResolvedRecipientProvider or has no more specific answer -- this is a
+// best-effort notify path, never a source of truth for the reply itself.
+func replyNotifyTarget(mp mail.Provider, msg mail.Message) string {
+	resolver, ok := mp.(mail.ResolvedRecipientProvider)
+	if !ok {
+		return msg.To
+	}
+	sessionID, err := resolver.ResolvedRecipientSessionID(msg.ID)
+	if err != nil || sessionID == "" {
+		return msg.To
+	}
+	return sessionID
 }
 
 // humaHandleMailDelete is the Huma-typed handler for DELETE /v0/mail/{id}.

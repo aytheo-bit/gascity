@@ -16,6 +16,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 )
@@ -1375,12 +1376,31 @@ func lastStartCallName(t *testing.T, sp *runtime.Fake) string {
 	return ""
 }
 
+// newSessionFakeStateWithSharedMailStore is newSessionFakeState plus one
+// correction: newFakeState's cityMailProv is backed by its own local store
+// (fs.stores["myrig"]'s backing store), never fs.cityBeadStore --
+// newSessionFakeState resets cityBeadStore to a second, separate MemStore
+// but leaves cityMailProv pointed at the first one. That split is invisible
+// for a plain send/reply (the "to" side is never re-resolved through
+// sessionStore), but a test that needs beadmail's OWN sender-alias
+// resolution (resolveSenderRoute, consulted by Reply's
+// fromSessionIDMetadataKey/fromDisplayMetadataKey handling) to see a session
+// created via createTestSession(fs.cityBeadStore, ...) needs both pointed at
+// the same store, matching how a real deployment always runs beadmail.New
+// against one store for both classes.
+func newSessionFakeStateWithSharedMailStore(t *testing.T) *fakeState {
+	t.Helper()
+	fs := newSessionFakeState(t)
+	fs.cityMailProv = beadmail.New(fs.cityBeadStore)
+	return fs
+}
+
 // TestMailReplyNotifyNudgesLiveRecipientSession covers the exact incident
 // shape: a human replies (via the dashboard, which only ever calls the HTTP
 // API) to a message from a live orchestrator session; notify:true must wake
 // that session the same way `gc mail reply --notify` would from the CLI.
 func TestMailReplyNotifyNudgesLiveRecipientSession(t *testing.T) {
-	fs := newSessionFakeState(t)
+	fs := newSessionFakeStateWithSharedMailStore(t)
 	orchestrator := createTestSession(t, fs.cityBeadStore, fs.sp, "Tier 0")
 	mp := fs.cityMailProv
 	// Reply direction is original.From -> reply.To, so seed the original
@@ -1407,6 +1427,73 @@ func TestMailReplyNotifyNudgesLiveRecipientSession(t *testing.T) {
 	}
 	if !strings.Contains(nudges[0].Message, "human") {
 		t.Errorf("nudge message = %q, want it to mention the sender %q", nudges[0].Message, "human")
+	}
+}
+
+// TestMailReplyNotifyDoesNotCollideWithAnUnrelatedSessionSharingTheAliasString
+// is the reply-path twin of the send-path collision test above, for the
+// second instance of the same bug class independent review found: a reply's
+// msg.To also prefers a display alias (beadToMessage), which a re-resolution
+// through workerHandleForSessionTarget can match to an unrelated live
+// session's exact bead ID before it matches the correct alias. The fix
+// (replyNotifyTarget, using mail.ResolvedRecipientProvider) reads the reply
+// bead's own Assignee, which beadmail.Reply already resolves with exact-ID
+// preference via the original message's fromSessionIDMetadataKey.
+func TestMailReplyNotifyDoesNotCollideWithAnUnrelatedSessionSharingTheAliasString(t *testing.T) {
+	fs := newSessionFakeStateWithSharedMailStore(t)
+	bystander := createTestSession(t, fs.cityBeadStore, fs.sp, "Bystander")
+	bystanderRuntimeName := lastStartCallName(t, fs.sp)
+	orchestrator := createTestSession(t, fs.cityBeadStore, fs.sp, "Tier 0")
+	orchestratorRuntimeName := lastStartCallName(t, fs.sp)
+	if bystanderRuntimeName == orchestratorRuntimeName {
+		t.Fatalf("test setup: bystander and orchestrator got the same runtime name %q", bystanderRuntimeName)
+	}
+
+	// Construct the collision: orchestrator's alias is literally bystander's
+	// own bead ID.
+	bead, err := fs.cityBeadStore.Get(orchestrator.ID)
+	if err != nil {
+		t.Fatalf("get orchestrator bead: %v", err)
+	}
+	metadata := map[string]string{"alias": bystander.ID}
+	for k, v := range bead.Metadata {
+		metadata[k] = v
+	}
+	if err := fs.cityBeadStore.Update(orchestrator.ID, beads.UpdateOpts{Metadata: metadata}); err != nil {
+		t.Fatalf("set colliding alias: %v", err)
+	}
+
+	mp := fs.cityMailProv
+	original, err := mp.Send(orchestrator.ID, "human", "Q1/Q2/Q3", "charter now or hold?")
+	if err != nil {
+		t.Fatalf("seed original message: %v", err)
+	}
+	h := newTestCityHandler(t, fs)
+
+	body := `{"from":"human","subject":"Re: Q1/Q2/Q3","body":"Q1 - A","notify":true}`
+	req := newPostRequest(cityURL(fs, "/mail/")+original.ID+"/reply", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("reply status = %d, want %d, body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var reply mail.Message
+	json.NewDecoder(rec.Body).Decode(&reply) //nolint:errcheck
+	if reply.To != bystander.ID {
+		t.Fatalf("persisted reply To = %q, want %q (the alias -- this is expected, not the bug)", reply.To, bystander.ID)
+	}
+
+	nudges := nudgeCallsTo(fs.sp)
+	if len(nudges) != 1 {
+		t.Fatalf("Nudge calls = %d, want exactly 1; all calls: %+v", len(nudges), fs.sp.SnapshotCalls())
+	}
+	if nudges[0].Name != orchestratorRuntimeName {
+		t.Fatalf("nudge landed on runtime %q, want orchestrator's runtime %q (bystander's runtime is %q) -- wrong session was notified",
+			nudges[0].Name, orchestratorRuntimeName, bystanderRuntimeName)
+	}
+	if got := fs.sp.CountCalls("Nudge", bystanderRuntimeName); got != 0 {
+		t.Fatalf("bystander (unrelated session whose ID collided with orchestrator's alias) received %d nudge(s), want 0", got)
 	}
 }
 
