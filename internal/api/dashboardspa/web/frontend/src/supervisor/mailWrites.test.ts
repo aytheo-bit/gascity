@@ -52,7 +52,7 @@ describe('supervisor mail writes: notify', () => {
   });
 
   it('PLANTED: replySupervisorMail defaults to notify:true when the draft omits it', async () => {
-    const replyMail = vi.fn(async () => undefined);
+    const replyMail = vi.fn();
     setSupervisorApiForTests({ ...baseApi, replyMail });
 
     await replySupervisorMail({ id: 'msg-1' }, { body: 'got it' }, 'human');
@@ -66,7 +66,7 @@ describe('supervisor mail writes: notify', () => {
   });
 
   it('PLANTED: replySupervisorMail honors an explicit notify:false override', async () => {
-    const replyMail = vi.fn(async () => undefined);
+    const replyMail = vi.fn();
     setSupervisorApiForTests({ ...baseApi, replyMail });
 
     await replySupervisorMail({ id: 'msg-1' }, { body: 'got it', notify: false }, 'human');
@@ -80,7 +80,7 @@ describe('supervisor mail writes: notify', () => {
   });
 
   it('sendSupervisorMail does not set notify unless the caller opts in (matches gc mail send default)', async () => {
-    const sendMail = vi.fn(async () => undefined);
+    const sendMail = vi.fn();
     setSupervisorApiForTests({ ...baseApi, sendMail });
 
     await sendSupervisorMail({ to: 'worker', subject: 'hi', body: 'hello' }, 'human');
@@ -94,7 +94,7 @@ describe('supervisor mail writes: notify', () => {
   });
 
   it('sendSupervisorMail passes an explicit notify:true through', async () => {
-    const sendMail = vi.fn(async () => undefined);
+    const sendMail = vi.fn();
     setSupervisorApiForTests({ ...baseApi, sendMail });
 
     await sendSupervisorMail({ to: 'worker', subject: 'hi', body: 'hello', notify: true }, 'human');
