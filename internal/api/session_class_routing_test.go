@@ -217,7 +217,7 @@ func TestMailRecipientResolutionReadsSessionsClass(t *testing.T) {
 	fs, info := splitSessionState(t)
 	srv := New(fs)
 
-	if _, err := srv.resolveMailSendRecipientWithContext(context.Background(), info.ID); err != nil {
+	if _, _, err := srv.resolveMailSendRecipientWithContext(context.Background(), info.ID); err != nil {
 		t.Fatalf("resolveMailSendRecipientWithContext: %v", err)
 	}
 

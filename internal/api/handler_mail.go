@@ -69,43 +69,57 @@ func (s *Server) findMailProviderByID(id string) (mail.Provider, string, error) 
 	return nil, "", firstErr
 }
 
-func (s *Server) resolveMailSendRecipientWithContext(ctx context.Context, recipient string) (string, error) {
+// resolveMailSendRecipientWithContext resolves the address to persist as the
+// message's To, and -- separately -- the exact session ID that address
+// refers to, when it resolved to a specific live/materializable session.
+//
+// These must NOT be collapsed into one string. The persisted address prefers
+// an alias over a bead ID (session.MailboxAddress), but a second resolution
+// pass over that same string later (workerHandleForSessionTarget, used to
+// notify the recipient after send) gives an exact session-ID match priority
+// over alias resolution. If a recipient's alias ever happened to collide
+// with an unrelated live session's raw bead ID, re-resolving the persisted
+// address string would silently nudge that unrelated session instead of the
+// actual recipient. A caller that needs to act on the resolved recipient
+// (not just display/persist it) must use sessionID when non-empty, never
+// re-resolve address.
+func (s *Server) resolveMailSendRecipientWithContext(ctx context.Context, recipient string) (address, sessionID string, err error) {
 	recipient = strings.TrimSpace(recipient)
 	if recipient == "human" {
-		return recipient, nil
+		return recipient, "", nil
 	}
 	store := s.state.SessionsBeadStore().Store
 	if store == nil {
-		resolved, err := mail.ResolveRecipient(recipient, agentEntries(s.state.Config()))
-		if err != nil {
-			return "", errMailNoBeadStore
+		resolved, resolveErr := mail.ResolveRecipient(recipient, agentEntries(s.state.Config()))
+		if resolveErr != nil {
+			return "", "", errMailNoBeadStore
 		}
-		return resolved, nil
+		return resolved, "", nil
 	}
-	if target, matched, err := s.resolveLiveConfiguredNamedMailTarget(store, recipient); err != nil {
-		return "", err
+	if target, matched, matchErr := s.resolveLiveConfiguredNamedMailTarget(store, recipient); matchErr != nil {
+		return "", "", matchErr
 	} else if matched {
-		return target.display, nil
+		return target.display, "", nil
 	}
-	if id, err := s.resolveSessionTargetIDWithContext(ctx, store, recipient, apiSessionResolveOptions{}); err == nil {
+	if id, resolveErr := s.resolveSessionTargetIDWithContext(ctx, store, recipient, apiSessionResolveOptions{}); resolveErr == nil {
 		bead, getErr := store.Get(id)
 		if getErr != nil {
-			return "", getErr
+			return "", "", getErr
 		}
-		address := session.MailboxAddress(bead)
-		if address == "" {
-			return "", fmt.Errorf("session %q has no mailbox identity", recipient)
+		resolvedAddress := session.MailboxAddress(bead)
+		if resolvedAddress == "" {
+			return "", "", fmt.Errorf("session %q has no mailbox identity", recipient)
 		}
-		return address, nil
-	} else if !errors.Is(err, session.ErrSessionNotFound) {
-		return "", err
+		return resolvedAddress, id, nil
+	} else if !errors.Is(resolveErr, session.ErrSessionNotFound) {
+		return "", "", resolveErr
 	}
-	if address, ok, err := s.configuredMailRecipientAddress(store, recipient); err != nil {
-		return "", err
+	if configuredAddress, ok, configErr := s.configuredMailRecipientAddress(store, recipient); configErr != nil {
+		return "", "", configErr
 	} else if ok {
-		return address, nil
+		return configuredAddress, "", nil
 	}
-	return "", apiSessionTargetNotFound(recipient)
+	return "", "", apiSessionTargetNotFound(recipient)
 }
 
 func (s *Server) resolveMailQueryRecipientsWithContext(ctx context.Context, recipient string) []string {

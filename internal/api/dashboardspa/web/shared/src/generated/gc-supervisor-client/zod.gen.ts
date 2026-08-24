@@ -748,12 +748,14 @@ export const zMailCountOutputBody = z.object({
 export const zMailReplyInputBody = z.object({
     body: z.string().optional(),
     from: z.string().optional(),
+    notify: z.boolean().optional(),
     subject: z.string().optional()
 });
 
 export const zMailSendInputBody = z.object({
     body: z.string().optional(),
     from: z.string().optional(),
+    notify: z.boolean().optional(),
     rig: z.string().optional(),
     subject: z.string().min(1),
     to: z.string().min(1)

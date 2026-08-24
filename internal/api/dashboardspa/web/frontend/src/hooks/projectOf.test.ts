@@ -253,6 +253,34 @@ describe('orchestration name sets stay in sync between sessions and agents', () 
       expect(isOrchestrationAgent({ name: id } as never)).toBe(true);
     },
   );
+
+  // A tier-numbered orchestrator (tier0-<charter>, tier1-<charter>, ...) is an
+  // open-ended role class, not a fixed enumerable set — an operator names a
+  // fresh Tier 0/1/2 charter per lane/gate, so a closed set would need a
+  // rebuild+redeploy every time a new one is spawned. Confirmed gap: a real
+  // custom charter (tier0-a2-dictionary) never showed as orchestration before
+  // this pattern existed.
+  const tierOrchestrationIdentifiers = [
+    'tier0-a2-dictionary',
+    'tier1-linear-closeout',
+    'tier1-nodeb-bridge',
+    'tier2-om6i-credential-build',
+  ];
+
+  it.each(tierOrchestrationIdentifiers)(
+    '"%s" (tier-numbered charter) is classified as orchestration on both shapes',
+    (id) => {
+      expect(isOrchestrationSession({ template: id } as never)).toBe(true);
+      expect(isOrchestrationAgent({ name: id } as never)).toBe(true);
+    },
+  );
+
+  it('does not loosely match a rig/pool name that merely contains "tier" as a substring', () => {
+    expect(isOrchestrationSession({ template: 'frontier-worker' } as never)).toBe(false);
+    expect(isOrchestrationAgent({ name: 'frontier-worker' } as never)).toBe(false);
+    // No trailing hyphen after the tier number: not a match.
+    expect(isOrchestrationSession({ template: 'tier0' } as never)).toBe(false);
+  });
 });
 
 describe('isAgentOutsideRig', () => {

@@ -19,6 +19,7 @@ import { Modal } from '../components/Modal';
 import { PageHeader } from '../components/PageHeader';
 import { PartialDataNotice } from '../components/PartialDataNotice';
 import { WorkInFlight } from '../components/WorkInFlight';
+import { OrchestratorsActive } from '../components/OrchestratorsActive';
 import { LiveSessionPeek, isAgentStreamable } from '../components/LiveSessionPeek';
 import { SseIndicator } from '../components/SseIndicator';
 import { StatusBadge, stateTone } from '../components/StatusBadge';
@@ -477,6 +478,12 @@ export function AgentsPage() {
 
       <WorkInFlight
         beads={beadsCache.data?.items ?? []}
+        sessions={sessionsCache.data?.items ?? []}
+        sessionsLoading={sessionsCache.loading}
+        sessionsError={sessionsCache.error}
+      />
+
+      <OrchestratorsActive
         sessions={sessionsCache.data?.items ?? []}
         sessionsLoading={sessionsCache.loading}
         sessionsError={sessionsCache.error}

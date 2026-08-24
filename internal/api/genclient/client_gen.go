@@ -2460,6 +2460,9 @@ type MailReplyInputBody struct {
 	// From Sender name.
 	From *string `json:"from,omitempty"`
 
+	// Notify Best-effort nudge the recipient's live session after replying, mirroring 'gc mail reply --notify'. No-op if the recipient has no live, nudgeable session -- never fails the reply.
+	Notify *bool `json:"notify,omitempty"`
+
 	// Subject Reply subject.
 	Subject *string `json:"subject,omitempty"`
 }
@@ -2471,6 +2474,9 @@ type MailSendInputBody struct {
 
 	// From Sender name.
 	From *string `json:"from,omitempty"`
+
+	// Notify Best-effort nudge the recipient's live session after sending, mirroring 'gc mail send --notify'. No-op if the recipient has no live, nudgeable session -- never fails the send.
+	Notify *bool `json:"notify,omitempty"`
 
 	// Rig Rig name.
 	Rig *string `json:"rig,omitempty"`

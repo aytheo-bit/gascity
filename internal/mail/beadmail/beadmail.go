@@ -266,6 +266,20 @@ func (p *Provider) InboxRecipients(recipients []string) ([]mail.Message, error) 
 	return p.filterMessagesForRecipients(recipients, false)
 }
 
+// ResolvedRecipientSessionID implements [mail.ResolvedRecipientProvider].
+// The stored Assignee already carries beadmail's own exact-session-ID
+// preference -- for a Reply specifically, that's toSessionID (read from the
+// original message's fromSessionIDMetadataKey) over the display-only From
+// fallback (see Reply, above), which is exactly the precision
+// beadToMessage's display-preferring To loses.
+func (p *Provider) ResolvedRecipientSessionID(id string) (string, error) {
+	b, err := p.store.Get(id)
+	if err != nil {
+		return "", beadmailError("resolved-recipient-session-id", err)
+	}
+	return strings.TrimSpace(b.Assignee), nil
+}
+
 // Get retrieves a message by ID without marking it read.
 // Returns an error if the bead is not a message type.
 func (p *Provider) Get(id string) (mail.Message, error) {
@@ -1286,5 +1300,8 @@ func generateThreadID() string {
 	return fmt.Sprintf("thread-%x", b)
 }
 
-// Compile-time interface check.
-var _ mail.Provider = (*Provider)(nil)
+// Compile-time interface checks.
+var (
+	_ mail.Provider                  = (*Provider)(nil)
+	_ mail.ResolvedRecipientProvider = (*Provider)(nil)
+)

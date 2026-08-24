@@ -62,6 +62,7 @@ type MailSendInput struct {
 		To      string `json:"to" doc:"Recipient name." minLength:"1"`
 		Subject string `json:"subject" doc:"Message subject." minLength:"1"`
 		Body    string `json:"body,omitempty" doc:"Message body."`
+		Notify  bool   `json:"notify,omitempty" doc:"Best-effort nudge the recipient's live session after sending, mirroring 'gc mail send --notify'. No-op if the recipient has no live, nudgeable session -- never fails the send."`
 	}
 }
 
@@ -96,6 +97,7 @@ type MailReplyInput struct {
 		From    string `json:"from,omitempty" doc:"Sender name."`
 		Subject string `json:"subject,omitempty" doc:"Reply subject."`
 		Body    string `json:"body,omitempty" doc:"Reply body."`
+		Notify  bool   `json:"notify,omitempty" doc:"Best-effort nudge the recipient's live session after replying, mirroring 'gc mail reply --notify'. No-op if the recipient has no live, nudgeable session -- never fails the reply."`
 	}
 }
 

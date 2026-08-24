@@ -151,3 +151,21 @@ type Provider interface {
 type MultiRecipientInboxer interface {
 	InboxRecipients(recipients []string) ([]Message, error)
 }
+
+// ResolvedRecipientProvider is an optional extension for providers that can
+// report a message's delivery target as a stable session ID, distinct from
+// its display To address. A message's To prefers a human-readable alias when
+// one exists (see beadmail's session.MailboxAddress-equivalent handling for
+// Reply) -- correct for display, but NOT safe to re-resolve as a worker
+// target through a second, separately-prioritized lookup: an alias that
+// happens to collide with an unrelated live session's raw ID would resolve
+// to that unrelated session. A caller that needs to act on a message's true
+// recipient (e.g. best-effort nudge it after send/reply) should prefer this
+// over re-resolving To, falling back to To only when a provider doesn't
+// implement this or returns no session ID.
+type ResolvedRecipientProvider interface {
+	// ResolvedRecipientSessionID returns the exact session ID a message was
+	// actually delivered to, or "" if the message didn't resolve to a
+	// specific session (e.g. "human", a static configured address).
+	ResolvedRecipientSessionID(messageID string) (string, error)
+}
