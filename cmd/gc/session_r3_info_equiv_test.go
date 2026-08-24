@@ -28,14 +28,19 @@ func (s setMetadataBatchFailStore) SetMetadataBatch(string, map[string]string) e
 // healOracleCase is a heal fixture plus the runtime/clock/lease knobs the heal
 // patch reads and the exact batch the Info form must return.
 type healOracleCase struct {
-	name     string
-	status   string
-	created  time.Duration // relative to clk.Now(); 0 = zero time
-	meta     map[string]string
-	alive    bool
-	timeout  time.Duration
-	rollback bool
-	want     map[string]string
+	name    string
+	status  string
+	created time.Duration // relative to clk.Now(); 0 = zero time
+	meta    map[string]string
+	alive   bool
+	// unobserved marks the liveness probe itself as failed (RuntimeFacts.Observed
+	// = false), distinct from alive=false (probe succeeded, runtime confirmed
+	// dead). Zero value (false) preserves every existing case's prior hardcoded-
+	// Observed:true behavior unchanged.
+	unobserved bool
+	timeout    time.Duration
+	rollback   bool
+	want       map[string]string
 }
 
 // TestHealStatePatchWithRollbackInfo pins healStatePatchWithRollbackInfo against
@@ -140,6 +145,20 @@ func TestHealStatePatchWithRollbackInfo(t *testing.T) {
 			rollback: true,
 			want:     map[string]string{"continuation_reset_pending": "true", "primed_at": "", "priming_attempted_at": "", "prompt_hash": "", "session_key": "", "sleep_reason": "runtime-missing", "started_config_hash": "", "state": "asleep"},
 		},
+		{
+			// gascity#5121: a failed liveness probe (Observed=false) must not be
+			// treated as a confirmed-dead runtime. Before the fix this produced
+			// the same drain batch as a genuinely observed-dead alive=false case
+			// ({"sleep_reason": "runtime-missing", "state": "asleep"}), silently
+			// respawning a healthy long-lived session on every transient probe
+			// failure.
+			name:       "unobserved-liveness-preserves-active",
+			meta:       map[string]string{"state": "active"},
+			alive:      false,
+			unobserved: true,
+			rollback:   true,
+			want:       nil,
+		},
 	}
 
 	for _, tc := range cases {
@@ -152,7 +171,7 @@ func TestHealStatePatchWithRollbackInfo(t *testing.T) {
 			if tc.created != 0 {
 				b.CreatedAt = clk.Now().Add(tc.created)
 			}
-			got := healStatePatchWithRollbackInfo(seedSessionInfo(b), tc.alive, clk, tc.timeout, tc.rollback)
+			got := healStatePatchWithRollbackInfo(seedSessionInfo(b), tc.alive, !tc.unobserved, clk, tc.timeout, tc.rollback)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("healStatePatchWithRollbackInfo = %#v, want %#v", got, tc.want)
 			}
@@ -175,7 +194,11 @@ func TestHealStateWithRollbackInfoClosedGuardAndWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	closed, _ = store.Get(closed.ID)
-	if batch := healStateWithRollbackInfo(sessiontest.SeedBead(t, closed), false, sessionFrontDoor(store), clk, 0, true); batch != nil {
+	batch, err := healStateWithRollbackInfo(sessiontest.SeedBead(t, closed), false, true, sessionFrontDoor(store), clk, 0, true)
+	if err != nil {
+		t.Fatalf("heal closed bead: %v", err)
+	}
+	if batch != nil {
 		t.Fatalf("closed bead heal batch = %#v, want nil (terminal beads must not move)", batch)
 	}
 
@@ -183,7 +206,10 @@ func TestHealStateWithRollbackInfoClosedGuardAndWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	batch := healStateWithRollbackInfo(sessiontest.SeedBead(t, live), false, sessionFrontDoor(store), clk, 0, true)
+	batch, err = healStateWithRollbackInfo(sessiontest.SeedBead(t, live), false, true, sessionFrontDoor(store), clk, 0, true)
+	if err != nil {
+		t.Fatalf("heal live bead: %v", err)
+	}
 	if batch["state"] != "asleep" {
 		t.Fatalf("heal batch = %#v, want state=asleep", batch)
 	}

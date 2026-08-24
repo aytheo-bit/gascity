@@ -307,6 +307,7 @@ func requestedRigEndpointState(rig config.Rig, currentState, cityState contract.
 			EndpointStatus: contract.EndpointStatusVerified,
 			DoltHost:       "127.0.0.1",
 			DoltPort:       strings.TrimSpace(opts.Port),
+			DoltMode:       "server",
 		}
 		if opts.AdoptUnverified {
 			state.EndpointStatus = contract.EndpointStatusUnverified
@@ -326,6 +327,7 @@ func requestedRigEndpointState(rig config.Rig, currentState, cityState contract.
 		DoltHost:       strings.TrimSpace(opts.Host),
 		DoltPort:       strings.TrimSpace(opts.Port),
 		DoltUser:       user,
+		DoltMode:       "server",
 	}
 	if opts.AdoptUnverified {
 		state.EndpointStatus = contract.EndpointStatusUnverified
@@ -360,6 +362,14 @@ func requireCanonicalScopeMetadata(fs fsys.FS, scopeRoot string) error {
 	return nil
 }
 
+// ensureCanonicalScopeMetadataIfPresent canonicalizes an existing scope's
+// metadata to server mode, for the endpoint commands (`gc rig set-endpoint`,
+// `gc beads city use-managed`/`use-external`).
+//
+// It announces the mode change for the same reason ensureCanonicalScopeMetadata
+// does: this is the identical rewrite through a different door, and a warning
+// that depends on which command performed the flip is a warning an operator
+// cannot rely on.
 func ensureCanonicalScopeMetadataIfPresent(fs fsys.FS, scopeRoot string) error {
 	path := filepath.Join(scopeRoot, ".beads", "metadata.json")
 	doltDatabase, err := func() (string, error) {
@@ -375,6 +385,7 @@ func ensureCanonicalScopeMetadataIfPresent(fs fsys.FS, scopeRoot string) error {
 	if err != nil {
 		return err
 	}
+	announceStorageModeChange(fs, path, "server", doltDatabase)
 	_, err = contract.EnsureCanonicalMetadata(fs, path, contract.MetadataState{
 		Database:     "dolt",
 		Backend:      "dolt",
@@ -714,8 +725,21 @@ func syncRigEndpointCompatConfig(fs fsys.FS, cityPath string, cfg *config.City, 
 		if !strings.EqualFold(cfg.Rigs[i].Name, rigName) {
 			continue
 		}
-		cfg.Rigs[i].DoltHost = strings.TrimSpace(state.DoltHost)
-		cfg.Rigs[i].DoltPort = strings.TrimSpace(state.DoltPort)
+		// An inherited rig must not carry the deprecated per-rig
+		// dolt_host/dolt_port in city.toml. A stamped target makes the beads
+		// reconciler treat the rig as an explicit override and churn its
+		// .beads/config.yaml back to `explicit` (dropping the inherited
+		// dolt.user) on every city start, and drifts into a hard error if the
+		// city endpoint later changes (validateCanonicalCompatDoltDrift). Clear
+		// it so the rig truly inherits — matching the managed-city path.
+		// Explicit and self targets keep their host/port.
+		if state.EndpointOrigin == contract.EndpointOriginInheritedCity {
+			cfg.Rigs[i].DoltHost = ""
+			cfg.Rigs[i].DoltPort = ""
+		} else {
+			cfg.Rigs[i].DoltHost = strings.TrimSpace(state.DoltHost)
+			cfg.Rigs[i].DoltPort = strings.TrimSpace(state.DoltPort)
+		}
 		return writeCityConfigForEditFS(fs, filepath.Join(cityPath, "city.toml"), cfg)
 	}
 	return fmt.Errorf("rig %q not found in city config", rigName)

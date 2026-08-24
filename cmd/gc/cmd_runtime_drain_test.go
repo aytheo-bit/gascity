@@ -74,6 +74,36 @@ func newFakeDrainOps() *fakeDrainOps {
 	}
 }
 
+func TestProviderDrainOpsClearRestartRequestedUsesCityTmuxSocket(t *testing.T) {
+	const socket = "bright-lights"
+	argsFile := filepath.Join(t.TempDir(), "args")
+	installFakeTmux(t, `printf '%s\n' "$@" > "$FAKE_TMUX_ARGS"`)
+	t.Setenv("FAKE_TMUX_ARGS", argsFile)
+
+	sp, err := newSessionProviderForCityByName(
+		nil,
+		"tmux",
+		config.SessionConfig{Socket: socket},
+		"city",
+		t.TempDir(),
+	)
+	if err != nil {
+		t.Fatalf("newSessionProviderForCityByName: %v", err)
+	}
+	if err := newDrainOps(sp).clearRestartRequested("worker"); err != nil {
+		t.Fatalf("clearRestartRequested: %v", err)
+	}
+
+	got, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("read fake tmux args: %v", err)
+	}
+	want := "-u\n-L\n" + socket + "\nset-environment\n-t\nworker\n-u\nGC_RESTART_REQUESTED\n"
+	if string(got) != want {
+		t.Fatalf("tmux args = %q, want %q", got, want)
+	}
+}
+
 func TestE2b2ProviderConstructionFailuresReturnThroughRun(t *testing.T) {
 	if cityPath, sessionID, markerPath, ok := e2b2ProviderFailureHelperArgs(os.Args); ok {
 		runE2b2ProviderFailureHelper(t, cityPath, sessionID, markerPath)
@@ -963,7 +993,7 @@ func TestDoRuntimeRequestRestartError(t *testing.T) {
 	dops := newFakeDrainOps()
 	dops.err = errors.New("tmux borked")
 	var stdout, stderr bytes.Buffer
-	code := doRuntimeRequestRestart(context.Background(), dops, nil, events.Discard, "worker", "worker",
+	code := doRuntimeRequestRestart(context.Background(), dops, runtime.NewFake(), nil, false, events.Discard, "worker", "worker",
 		time.Millisecond, time.Second, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("code = %d, want 1", code)
@@ -973,11 +1003,43 @@ func TestDoRuntimeRequestRestartError(t *testing.T) {
 	}
 }
 
+// TestDoRuntimeRequestRestart_PinnedRequiresPersistRestart covers Fix 1 for
+// the gc runtime request-restart path: a pinned session (pin_awake ==
+// "true") is kill-protected by the reconciler unless an explicit controller
+// reset is persisted, so persistRestart is mandatory rather than best-effort
+// when pinned is true. Mirrors TestDoHandoff_PinnedAlwaysSessionRequiresPersistRestart.
+func TestDoRuntimeRequestRestart_PinnedRequiresPersistRestart(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		persistRestart func() error
+	}{
+		{name: "nil persistRestart"},
+		{name: "persistRestart error", persistRestart: func() error { return errors.New("worker boundary unavailable") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dops := newFakeDrainOps()
+			rec := events.NewFake()
+			var stdout, stderr bytes.Buffer
+			code := doRuntimeRequestRestart(context.Background(), dops, runtime.NewFake(), tc.persistRestart, true, rec, "mayor", "mayor",
+				10*time.Millisecond, time.Second, &stdout, &stderr)
+			if code != 1 {
+				t.Fatalf("code = %d, want 1; stderr: %s", code, stderr.String())
+			}
+			if got := stdout.String(); strings.Contains(got, "Restart requested") {
+				t.Errorf("stdout = %q, must not promise a restart when persistRestart is unavailable for a pinned session", got)
+			}
+			if len(rec.Events) != 0 {
+				t.Fatalf("got %d events, want 0 (must not record SessionDraining without a real restart request); events=%v", len(rec.Events), rec.Events)
+			}
+		})
+	}
+}
+
 func TestDoRuntimeRequestRestartFlagCleared(t *testing.T) {
 	dops := &drainOpsWithCountdown{fakeDrainOps: newFakeDrainOps(), remaining: 2}
 
 	var stdout, stderr bytes.Buffer
-	code := doRuntimeRequestRestart(context.Background(), dops, nil, events.Discard, "worker", "worker",
+	code := doRuntimeRequestRestart(context.Background(), dops, runtime.NewFake(), nil, false, events.Discard, "worker", "worker",
 		10*time.Millisecond, 5*time.Second, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("code = %d, want 0 when flag cleared; stderr: %s", code, stderr.String())
@@ -997,7 +1059,7 @@ func TestDoRuntimeRequestRestartTimeout(t *testing.T) {
 	dops := newFakeDrainOps()
 
 	var stdout, stderr bytes.Buffer
-	code := doRuntimeRequestRestart(context.Background(), dops, nil, events.Discard, "worker", "worker",
+	code := doRuntimeRequestRestart(context.Background(), dops, runtime.NewFake(), nil, false, events.Discard, "worker", "worker",
 		10*time.Millisecond, 25*time.Millisecond, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("code = %d, want 1 on timeout", code)
@@ -1015,7 +1077,7 @@ func TestDoRuntimeRequestRestartTimeoutReportsLastPollError(t *testing.T) {
 	dops.restartReadErr = errors.New("metadata read failed")
 
 	var stdout, stderr bytes.Buffer
-	code := doRuntimeRequestRestart(context.Background(), dops, nil, events.Discard, "worker", "worker",
+	code := doRuntimeRequestRestart(context.Background(), dops, runtime.NewFake(), nil, false, events.Discard, "worker", "worker",
 		10*time.Millisecond, 25*time.Millisecond, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("code = %d, want 1 on timeout", code)
@@ -1033,7 +1095,7 @@ func TestDoRuntimeRequestRestartContextCancel(t *testing.T) {
 
 	done := make(chan int, 1)
 	go func() {
-		done <- doRuntimeRequestRestart(ctx, dops, nil, events.Discard, "worker", "worker",
+		done <- doRuntimeRequestRestart(ctx, dops, runtime.NewFake(), nil, false, events.Discard, "worker", "worker",
 			10*time.Millisecond, 30*time.Second, &stdout, &stderr)
 	}()
 
@@ -1145,7 +1207,7 @@ func TestDoRuntimeRequestRestartProceedsAndPendsOnCancel(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	done := make(chan int, 1)
 	go func() {
-		done <- doRuntimeRequestRestart(ctx, dops, persistRestart, events.Discard, "mayor", "mayor",
+		done <- doRuntimeRequestRestart(ctx, dops, runtime.NewFake(), persistRestart, false, events.Discard, "mayor", "mayor",
 			10*time.Millisecond, 30*time.Second, &stdout, &stderr)
 	}()
 
@@ -1346,6 +1408,14 @@ func TestDrainAckNoArgsFallsBackToCityPathEnv(t *testing.T) {
 	old := drainAckPokeController
 	drainAckPokeController = func(string) error { return nil }
 	t.Cleanup(func() { drainAckPokeController = old })
+
+	// drain-ack now reads the city store to release any in_progress claim the
+	// session is still holding, so this bare temp city needs the same store
+	// guards its siblings in this file use — otherwise the read provisions a
+	// managed Dolt server the test never tears down.
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
 
 	cityDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
