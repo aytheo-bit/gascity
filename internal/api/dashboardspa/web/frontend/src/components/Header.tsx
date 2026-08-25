@@ -33,6 +33,12 @@ const EXPLICIT_ROUTES: ReadonlyArray<NavRoute> = [
   // (otherwise every nested route would also be 'active').
   { to: '/', label: 'Home', end: true, order: 10 },
   { to: '/agents', label: 'Agents', order: 20 },
+  // gascity-dashboard-sessions-view: the single unfiltered view of every
+  // live session — sits right after Agents since it answers the same
+  // "what's happening" question, without either of Agents' role gates
+  // (Workers active's worker/polecat suffix, Orchestrators active's
+  // mayor/tier<N>- prefix set).
+  { to: '/sessions', label: 'Sessions', order: 25 },
   { to: '/beads', label: 'Beads', order: 30 },
   { to: '/runs', label: 'Runs', order: 40 },
   { to: '/mail', label: 'Mail', order: 50 },
@@ -73,8 +79,7 @@ export function Header() {
   // True once the list has loaded and the selected city is a member. While the
   // list is empty (pre-load or a transient fetch blip) we do NOT flag the city
   // as unknown — only a loaded list that omits it is a real miss.
-  const activeCityKnown =
-    selectedCity === '' || cityItems.some((c) => c.name === selectedCity);
+  const activeCityKnown = selectedCity === '' || cityItems.some((c) => c.name === selectedCity);
   // Show the switcher whenever there's a choice to make, or when the selected
   // city is unknown — in the latter case the disabled "(unknown)" option keeps
   // the stale city visible instead of an empty select.
