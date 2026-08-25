@@ -4,6 +4,7 @@ import { Button } from '../components/Button';
 import { ListSearchBar } from '../components/ListSearchBar';
 import { Modal } from '../components/Modal';
 import { PageHeader } from '../components/PageHeader';
+import { PartialDataNotice } from '../components/PartialDataNotice';
 import { LiveSessionPeek } from '../components/LiveSessionPeek';
 import { SseIndicator } from '../components/SseIndicator';
 import { StatusBadge, stateTone } from '../components/StatusBadge';
@@ -182,6 +183,11 @@ export function SessionsPage() {
                 {error}
               </span>
             )}
+            <PartialDataNotice
+              show={data?.partial === true}
+              label="sessions partial"
+              title={data?.partial_errors?.join('\n') ?? 'one or more session backends unavailable'}
+            />
             <Button size="sm" onClick={() => void refresh()} disabled={loading}>
               {loading ? 'Refreshing' : 'Refresh'}
             </Button>

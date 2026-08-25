@@ -75,13 +75,13 @@ const SESSIONS_PAYLOAD = {
   total: 2,
 };
 
-function stubFetch() {
+function stubFetch(payload: unknown = SESSIONS_PAYLOAD) {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL) => {
       const url = requestUrl(input);
       if (url.startsWith('/v0/city/test-city/sessions')) {
-        return jsonResponse(SESSIONS_PAYLOAD);
+        return jsonResponse(payload);
       }
       throw new Error(`unexpected fetch: ${url}`);
     }),
@@ -147,5 +147,30 @@ describe('SessionsPage', () => {
 
     expect(screen.queryByText('mayor')).toBeNull();
     expect(screen.getByText('Tier 2: A2 ContentBuild Linux port execution')).toBeTruthy();
+  });
+
+  it('surfaces a partial session-list response instead of silently under-reporting', async () => {
+    // A 200 response with partial:true means one or more backends failed
+    // during aggregation and `items` is incomplete — this page's whole
+    // purpose is showing every live session, so a partial result must be
+    // visible, not read as a confident "N live sessions" all-clear.
+    vi.unstubAllGlobals();
+    stubFetch({
+      items: [SESSIONS_PAYLOAD.items[0]],
+      total: 1,
+      partial: true,
+      partial_errors: ['rig backend gascity-packs unavailable'],
+    });
+
+    render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <NowProvider intervalMs={1_000_000}>
+          <SessionsPage />
+        </NowProvider>
+      </MemoryRouter>,
+    );
+
+    await screen.findByText('Tier 2: A2 ContentBuild Linux port execution');
+    expect(screen.getByText('sessions partial')).toBeTruthy();
   });
 });
