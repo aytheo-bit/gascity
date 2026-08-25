@@ -39,6 +39,9 @@ const FormulaRunDetailPage = lazy(() =>
   import('./routes/FormulaRunDetail').then((m) => ({ default: m.FormulaRunDetailPage })),
 );
 const RunsPage = lazy(() => import('./routes/Runs').then((m) => ({ default: m.RunsPage })));
+const SessionsPage = lazy(() =>
+  import('./routes/Sessions').then((m) => ({ default: m.SessionsPage })),
+);
 
 export function App() {
   // NowProvider lives at the App root because useFaviconSignal (R8) is
@@ -156,6 +159,7 @@ function RoutedMain({
           />
           <Route path="/agents" element={<AgentsPage />} />
           <Route path="/agents/:slug" element={<AgentDetailPage />} />
+          <Route path="/sessions" element={<SessionsPage />} />
           <Route path="/beads" element={<BeadsPage />} />
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/runs/:runId" element={<FormulaRunDetailPage />} />
