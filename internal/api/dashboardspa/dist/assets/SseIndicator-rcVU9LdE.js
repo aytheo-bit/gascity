@@ -1,0 +1,1 @@
+import{j as c,S as r}from"./index-BFvODXXU.js";function i({state:n}){const e=n==="open"?"ok":n==="connecting"||n==="degraded"?"warn":"stuck",o=n==="open"?"live":n==="connecting"?"connecting":n==="degraded"?"degraded":"offline";return c.jsx(r,{tone:e,label:o,title:`SSE stream: ${n}`,className:"w-28"})}export{i as S};
