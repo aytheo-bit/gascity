@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -1036,6 +1036,163 @@ func TestNativeDoltStoreSetMetadataBatchRejectsInvalidExistingMetadata(t *testin
 	}
 }
 
+func TestNativeDoltStoreMetadataUpdatesPreserveUnrelatedJSONTypes(t *testing.T) {
+	const initial = `{"dependency_external_refs":[],"linear_dynamic_sync":{"linearId":"76a1610a-474b-4633-937f-8354b9087aab","routing":{"labelIds":[]}},"notion_review_schema":1,"review_order":1,"shared_risk_keys":[],"source_digests":{"manifest":"abc123"},"tier":1,"tier_position":1,"enabled":true,"optional":null}`
+	issue := &beadslib.Issue{
+		ID:        "gc-typed-metadata",
+		Title:     "typed metadata route",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.TypeTask,
+		Priority:  1,
+		Metadata:  json.RawMessage(initial),
+	}
+	storage := &nativeDoltStorageSpy{}
+	storage.getIssue = func(context.Context, string) (*beadslib.Issue, error) {
+		return cloneNativeIssueForTest(issue), nil
+	}
+	storage.updateIssue = func(_ context.Context, _ string, updates map[string]interface{}, _ string) error {
+		if rawValue, present := updates["metadata"]; present {
+			raw, ok := rawValue.(json.RawMessage)
+			if !ok {
+				return fmt.Errorf("metadata update has type %T, want json.RawMessage", rawValue)
+			}
+			issue.Metadata = append(json.RawMessage(nil), raw...)
+		}
+		if title, present := updates["title"].(string); present {
+			issue.Title = title
+		}
+		return nil
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	if err := store.SetMetadataBatch(issue.ID, map[string]string{
+		"gc.routed_to":     "openwebui-doc-architecture",
+		"gc.session_alias": "owui-doc-architecture",
+	}); err != nil {
+		t.Fatalf("SetMetadataBatch(route): %v", err)
+	}
+	if err := store.Update(issue.ID, UpdateOpts{
+		Metadata: map[string]string{"merge_strategy": "mr"},
+	}); err != nil {
+		t.Fatalf("Update(merge strategy): %v", err)
+	}
+
+	assertMetadataJSONEquivalent(t, issue.Metadata, initial, map[string]string{
+		"gc.routed_to":     "openwebui-doc-architecture",
+		"gc.session_alias": "owui-doc-architecture",
+		"merge_strategy":   "mr",
+	})
+}
+
+func TestNativeDoltStoreTransactionalMetadataUpdatePreservesUnrelatedJSONTypes(t *testing.T) {
+	const initial = `{"nested":{"labels":[]},"count":3,"enabled":true,"optional":null}`
+	issue := &beadslib.Issue{ID: "gc-typed-tx", Metadata: json.RawMessage(initial)}
+	storage := &nativeDoltStorageSpy{}
+	storage.getIssue = func(context.Context, string) (*beadslib.Issue, error) {
+		return cloneNativeIssueForTest(issue), nil
+	}
+	storage.updateIssue = func(_ context.Context, _ string, updates map[string]interface{}, _ string) error {
+		if rawValue, present := updates["metadata"]; present {
+			raw, ok := rawValue.(json.RawMessage)
+			if !ok {
+				return fmt.Errorf("metadata update has type %T, want json.RawMessage", rawValue)
+			}
+			issue.Metadata = append(json.RawMessage(nil), raw...)
+		}
+		if title, present := updates["title"].(string); present {
+			issue.Title = title
+		}
+		return nil
+	}
+	store := newNativeDoltStoreForTest(storage)
+	tx := nativeDoltTransactionForTest{storage: storage}
+
+	if err := store.applySetMetadataBatchInTx(context.Background(), tx, issue.ID, map[string]string{"gc.routed_to": "architecture"}); err != nil {
+		t.Fatalf("applySetMetadataBatchInTx: %v", err)
+	}
+	title := "ratified architecture"
+	if err := store.applyUpdateInTx(context.Background(), tx, issue.ID, UpdateOpts{
+		Title:    &title,
+		Metadata: map[string]string{"merge_strategy": "mr"},
+	}); err != nil {
+		t.Fatalf("applyUpdateInTx: %v", err)
+	}
+	if issue.Title != title {
+		t.Fatalf("title = %q, want %q", issue.Title, title)
+	}
+	assertMetadataJSONEquivalent(t, issue.Metadata, initial, map[string]string{
+		"gc.routed_to":   "architecture",
+		"merge_strategy": "mr",
+	})
+}
+
+func assertMetadataJSONEquivalent(t *testing.T, actual json.RawMessage, initial string, additions map[string]string) {
+	t.Helper()
+	var expected map[string]interface{}
+	if err := json.Unmarshal([]byte(initial), &expected); err != nil {
+		t.Fatalf("unmarshal expected metadata: %v", err)
+	}
+	for key, value := range additions {
+		expected[key] = value
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal(actual, &got); err != nil {
+		t.Fatalf("unmarshal stored metadata: %v", err)
+	}
+	if !reflect.DeepEqual(got, expected) {
+		t.Fatalf("stored metadata = %#v, want %#v", got, expected)
+	}
+}
+
+func TestNativeDoltStoreSetMetadataBatchEmptyIsNoop(t *testing.T) {
+	getCalls := 0
+	updateCalls := 0
+	storage := &nativeDoltStorageSpy{
+		getIssue: func(context.Context, string) (*beadslib.Issue, error) {
+			getCalls++
+			return nil, errors.New("unexpected GetIssue")
+		},
+		updateIssue: func(context.Context, string, map[string]interface{}, string) error {
+			updateCalls++
+			return errors.New("unexpected UpdateIssue")
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	for _, metadata := range []map[string]string{nil, {}} {
+		if err := store.SetMetadataBatch("gc-empty", metadata); err != nil {
+			t.Fatalf("SetMetadataBatch(%#v): %v", metadata, err)
+		}
+	}
+	if getCalls != 0 || updateCalls != 0 {
+		t.Fatalf("empty batches called storage: GetIssue=%d UpdateIssue=%d", getCalls, updateCalls)
+	}
+}
+
+func TestMergeNativeMetadataStringValuesInitializesAbsentOrNullMetadata(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		existing json.RawMessage
+	}{
+		{name: "absent"},
+		{name: "null", existing: json.RawMessage("null")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw, err := mergeNativeMetadataStringValues(test.existing, map[string]string{"merge_strategy": "mr"})
+			if err != nil {
+				t.Fatalf("mergeNativeMetadataStringValues: %v", err)
+			}
+			var got map[string]interface{}
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatalf("unmarshal merged metadata: %v", err)
+			}
+			if len(got) != 1 || got["merge_strategy"] != "mr" {
+				t.Fatalf("merged metadata = %#v, want only merge_strategy=mr", got)
+			}
+		})
+	}
+}
+
 func TestNativeDoltStoreSetMetadataBatchRetriesSerializationConflictFromFreshState(t *testing.T) {
 	getCalls := 0
 	updateCalls := 0
@@ -1045,7 +1202,7 @@ func TestNativeDoltStoreSetMetadataBatchRetriesSerializationConflictFromFreshSta
 			getCalls++
 			metadata := json.RawMessage(`{"existing":"before-conflict"}`)
 			if getCalls > 1 {
-				metadata = json.RawMessage(`{"concurrent":"preserved"}`)
+				metadata = json.RawMessage(`{"concurrent":{"labels":[]},"count":2,"enabled":true}`)
 			}
 			return &beadslib.Issue{
 				ID:        "gc-conflict",
@@ -1080,12 +1237,17 @@ func TestNativeDoltStoreSetMetadataBatchRetriesSerializationConflictFromFreshSta
 	if updateCalls != 2 {
 		t.Fatalf("UpdateIssue calls = %d, want 2", updateCalls)
 	}
-	var got map[string]string
+	var got map[string]interface{}
 	if err := json.Unmarshal(writtenMetadata, &got); err != nil {
 		t.Fatalf("unmarshal written metadata: %v", err)
 	}
-	want := map[string]string{"concurrent": "preserved", "requested": "written"}
-	if !maps.Equal(got, want) {
+	want := map[string]interface{}{
+		"concurrent": map[string]interface{}{"labels": []interface{}{}},
+		"count":      float64(2),
+		"enabled":    true,
+		"requested":  "written",
+	}
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("written metadata = %#v, want %#v", got, want)
 	}
 }
