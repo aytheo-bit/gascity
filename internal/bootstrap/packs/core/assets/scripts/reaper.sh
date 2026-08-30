@@ -180,6 +180,7 @@ TOTAL_EXPIRED_ISSUES_SKIPPED=0
 TOTAL_SESSIONS_PRUNED=0
 SESSION_PRUNE_ATTEMPTED=0
 ANOMALIES=""
+BACKUP_GUARD_ANOMALY_RECORDED=0
 
 sanitize_output() {
     local flattened
@@ -196,6 +197,65 @@ record_anomaly() {
     shift
     ANOMALIES="${ANOMALIES}$db: $*
 "
+}
+
+record_backup_guard_anomaly() {
+    BACKUP_GUARD_ANOMALY_RECORDED=1
+    record_anomaly "$@"
+}
+
+should_emit_anomaly_alert() {
+    local cooldown="${GC_REAPER_ANOMALY_ALERT_COOLDOWN_SECONDS:-86400}"
+    local state_dir="$CITY_ABS/.gc/state"
+    local state_file="$state_dir/reaper-anomaly-alert.state"
+    local normalized fingerprint previous_fingerprint previous_epoch now_epoch age
+
+    case "$cooldown" in ''|*[!0-9]*) cooldown=86400 ;; esac
+
+    # Only coalesce runs whose sole finding is the fail-closed backup guard.
+    # Any other anomaly remains immediately visible, even during the cooldown.
+    [ "$BACKUP_GUARD_ANOMALY_RECORDED" -eq 1 ] || return 0
+    if printf '%s' "$ANOMALIES" \
+        | grep -v 'bulk prune skipped: backup stale or absent' \
+        | grep -q '[^[:space:]]'; then
+        return 0
+    fi
+
+    # Only the continuously advancing numeric age is noise. Transitions
+    # between absent, unparseable, and stale-present are distinct failures.
+    normalized=$(printf '%s' "$ANOMALIES" \
+        | sed -E 's/age=[0-9]+s/age=stale/g')
+    fingerprint=$(printf '%s' "$normalized" | cksum | awk '{print $1 ":" $2}')
+    now_epoch=$(date -u '+%s')
+    previous_fingerprint=""
+    previous_epoch=""
+    if [ -f "$state_file" ]; then
+        IFS=' ' read -r previous_fingerprint previous_epoch < "$state_file" || true
+    fi
+
+    if [ "$previous_fingerprint" = "$fingerprint" ] \
+        && [ -n "$previous_epoch" ] \
+        && [ "$previous_epoch" -le "$now_epoch" ] 2>/dev/null; then
+        age=$(( now_epoch - previous_epoch ))
+        [ "$age" -lt "$cooldown" ] && return 1
+    fi
+
+    REAPER_ANOMALY_FINGERPRINT="$fingerprint"
+    REAPER_ANOMALY_STATE_DIR="$state_dir"
+    REAPER_ANOMALY_STATE_FILE="$state_file"
+    REAPER_ANOMALY_NOW_EPOCH="$now_epoch"
+    return 0
+}
+
+record_anomaly_alert_receipt() {
+    local tmp
+    [ -n "${REAPER_ANOMALY_STATE_FILE:-}" ] || return 0
+    mkdir -p "$REAPER_ANOMALY_STATE_DIR" 2>/dev/null || return 0
+    tmp="$REAPER_ANOMALY_STATE_FILE.tmp.$$"
+    if printf '%s %s\n' "$REAPER_ANOMALY_FINGERPRINT" "$REAPER_ANOMALY_NOW_EPOCH" > "$tmp"; then
+        chmod 600 "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$REAPER_ANOMALY_STATE_FILE" 2>/dev/null || rm -f "$tmp"
+    fi
 }
 
 CITY_DB_ANOMALY_RECORDED=0
@@ -1180,12 +1240,12 @@ if [ -d "$CITY_BEADS_DIR" ]; then
         fi
         _PRUNE_SKIP=0
         if [ ! -f "$_BACKUP_STATE" ]; then
-            record_anomaly "$SESSION_PRUNE_ANOMALY_SCOPE" "bulk prune skipped: backup stale or absent (source=$_BACKUP_STATE age=absent threshold=${_PRUNE_MAX_AGE}s)"
+            record_backup_guard_anomaly "$SESSION_PRUNE_ANOMALY_SCOPE" "bulk prune skipped: backup stale or absent (source=$_BACKUP_STATE age=absent threshold=${_PRUNE_MAX_AGE}s)"
             _PRUNE_SKIP=1
         else
             _BACKUP_TS=$(sed -n "s/.*\"$_BACKUP_FIELD\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$_BACKUP_STATE" | head -1)
             if [ -z "$_BACKUP_TS" ]; then
-                record_anomaly "$SESSION_PRUNE_ANOMALY_SCOPE" "bulk prune skipped: backup stale or absent (source=$_BACKUP_STATE age=unparseable threshold=${_PRUNE_MAX_AGE}s)"
+                record_backup_guard_anomaly "$SESSION_PRUNE_ANOMALY_SCOPE" "bulk prune skipped: backup stale or absent (source=$_BACKUP_STATE age=unparseable threshold=${_PRUNE_MAX_AGE}s)"
                 _PRUNE_SKIP=1
             else
                 # Real on-disk timestamps are RFC3339Nano. Truncate to whole
@@ -1198,12 +1258,12 @@ if [ -d "$CITY_BEADS_DIR" ]; then
                     || echo "")
                 _NOW_EPOCH=$(date -u '+%s')
                 if [ -z "$_BACKUP_EPOCH" ]; then
-                    record_anomaly "$SESSION_PRUNE_ANOMALY_SCOPE" "bulk prune skipped: backup stale or absent (source=$_BACKUP_STATE age=unparseable threshold=${_PRUNE_MAX_AGE}s)"
+                    record_backup_guard_anomaly "$SESSION_PRUNE_ANOMALY_SCOPE" "bulk prune skipped: backup stale or absent (source=$_BACKUP_STATE age=unparseable threshold=${_PRUNE_MAX_AGE}s)"
                     _PRUNE_SKIP=1
                 else
                     _BACKUP_AGE=$(( _NOW_EPOCH - _BACKUP_EPOCH ))
                     if [ "$_BACKUP_AGE" -gt "$_PRUNE_MAX_AGE" ]; then
-                        record_anomaly "$SESSION_PRUNE_ANOMALY_SCOPE" "bulk prune skipped: backup stale or absent (source=$_BACKUP_STATE age=${_BACKUP_AGE}s threshold=${_PRUNE_MAX_AGE}s)"
+                        record_backup_guard_anomaly "$SESSION_PRUNE_ANOMALY_SCOPE" "bulk prune skipped: backup stale or absent (source=$_BACKUP_STATE age=${_BACKUP_AGE}s threshold=${_PRUNE_MAX_AGE}s)"
                         _PRUNE_SKIP=1
                     fi
                 fi
@@ -1283,10 +1343,12 @@ if [ "$HAD_DATABASES" -eq 0 ] && [ "$SESSION_PRUNE_ATTEMPTED" -eq 0 ]; then
 fi
 
 # Report.
-if [ -n "$ANOMALIES" ]; then
-    "$ESCALATE_SCRIPT" \
+if [ -n "$ANOMALIES" ] && should_emit_anomaly_alert; then
+    if "$ESCALATE_SCRIPT" \
         --subject "ESCALATION: Reaper anomalies detected [MEDIUM]" \
-        --message "$ANOMALIES" 2>/dev/null || true
+        --message "$ANOMALIES" 2>/dev/null; then
+        record_anomaly_alert_receipt
+    fi
 fi
 
 SUMMARY="reaper — stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, workflow_roots:$TOTAL_WORKFLOW_ROOTS_CLOSED, skipped_cross_store_workflow_roots:$TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED, skipped_non_city_workflow_issue_roots:$TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS"

@@ -116,7 +116,8 @@ run_prune_scenario() {
 set -euo pipefail
 gc()            { touch '$bd_flag'; printf '{"pruned_count":3}'; }
 record_anomaly(){ touch '$anomaly_flag'; printf '%s\n' "\$*" >> '$anomaly_msg_file'; }
-export -f gc record_anomaly
+record_backup_guard_anomaly(){ record_anomaly "\$@"; }
+export -f gc record_anomaly record_backup_guard_anomaly
 CITY_ABS='$tmpdir'
 CITY_BEADS_DIR='$tmpdir/.beads'
 SESSION_BEAD_PATTERN='gm-*'
