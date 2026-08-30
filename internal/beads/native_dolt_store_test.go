@@ -887,6 +887,118 @@ func TestNativeDoltStoreSetMetadataBatchRejectsInvalidExistingMetadata(t *testin
 	}
 }
 
+func TestNativeDoltStoreMetadataUpdatesPreserveUnrelatedJSONTypes(t *testing.T) {
+	const initial = `{"dependency_external_refs":[],"linear_dynamic_sync":{"linearId":"76a1610a-474b-4633-937f-8354b9087aab","routing":{"labelIds":[]}},"notion_review_schema":1,"review_order":1,"shared_risk_keys":[],"source_digests":{"manifest":"abc123"},"tier":1,"tier_position":1,"enabled":true,"optional":null}`
+	issue := &beadslib.Issue{
+		ID:        "gc-typed-metadata",
+		Title:     "typed metadata route",
+		Status:    beadslib.StatusOpen,
+		IssueType: beadslib.TypeTask,
+		Priority:  1,
+		Metadata:  json.RawMessage(initial),
+	}
+	storage := &nativeDoltStorageSpy{}
+	storage.getIssue = func(context.Context, string) (*beadslib.Issue, error) {
+		return cloneNativeIssueForTest(issue), nil
+	}
+	storage.updateIssue = func(_ context.Context, _ string, updates map[string]interface{}, _ string) error {
+		raw, ok := updates["metadata"].(json.RawMessage)
+		if !ok {
+			return fmt.Errorf("metadata update has type %T, want json.RawMessage", updates["metadata"])
+		}
+		issue.Metadata = append(json.RawMessage(nil), raw...)
+		if assignee, ok := updates["assignee"].(string); ok {
+			issue.Assignee = assignee
+		}
+		return nil
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	if err := store.SetMetadataBatch(issue.ID, map[string]string{
+		"gc.routed_to":     "openwebui-doc-architecture",
+		"gc.session_alias": "owui-doc-architecture",
+	}); err != nil {
+		t.Fatalf("SetMetadataBatch(route): %v", err)
+	}
+	if err := store.Update(issue.ID, UpdateOpts{
+		Metadata: map[string]string{"merge_strategy": "mr"},
+	}); err != nil {
+		t.Fatalf("Update(merge strategy): %v", err)
+	}
+
+	var expected map[string]interface{}
+	if err := json.Unmarshal([]byte(initial), &expected); err != nil {
+		t.Fatalf("unmarshal expected metadata: %v", err)
+	}
+	expected["gc.routed_to"] = "openwebui-doc-architecture"
+	expected["gc.session_alias"] = "owui-doc-architecture"
+	expected["merge_strategy"] = "mr"
+	want, err := json.Marshal(expected)
+	if err != nil {
+		t.Fatalf("marshal expected metadata: %v", err)
+	}
+	var actual map[string]interface{}
+	if err := json.Unmarshal(issue.Metadata, &actual); err != nil {
+		t.Fatalf("unmarshal stored metadata: %v", err)
+	}
+	got, err := json.Marshal(actual)
+	if err != nil {
+		t.Fatalf("marshal stored metadata: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("stored metadata = %s, want %s", got, want)
+	}
+}
+
+func TestNativeDoltStoreSetMetadataBatchEmptyIsNoop(t *testing.T) {
+	getCalls := 0
+	updateCalls := 0
+	storage := &nativeDoltStorageSpy{
+		getIssue: func(context.Context, string) (*beadslib.Issue, error) {
+			getCalls++
+			return nil, errors.New("unexpected GetIssue")
+		},
+		updateIssue: func(context.Context, string, map[string]interface{}, string) error {
+			updateCalls++
+			return errors.New("unexpected UpdateIssue")
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	for _, metadata := range []map[string]string{nil, {}} {
+		if err := store.SetMetadataBatch("gc-empty", metadata); err != nil {
+			t.Fatalf("SetMetadataBatch(%#v): %v", metadata, err)
+		}
+	}
+	if getCalls != 0 || updateCalls != 0 {
+		t.Fatalf("empty batches called storage: GetIssue=%d UpdateIssue=%d", getCalls, updateCalls)
+	}
+}
+
+func TestMergeNativeMetadataStringValuesInitializesAbsentOrNullMetadata(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		existing json.RawMessage
+	}{
+		{name: "absent"},
+		{name: "null", existing: json.RawMessage("null")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw, err := mergeNativeMetadataStringValues(test.existing, map[string]string{"merge_strategy": "mr"})
+			if err != nil {
+				t.Fatalf("mergeNativeMetadataStringValues: %v", err)
+			}
+			var got map[string]interface{}
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatalf("unmarshal merged metadata: %v", err)
+			}
+			if len(got) != 1 || got["merge_strategy"] != "mr" {
+				t.Fatalf("merged metadata = %#v, want only merge_strategy=mr", got)
+			}
+		})
+	}
+}
+
 func TestNativeDoltStoreReadyFiltersGasCityExcludedTypesBeforeLimit(t *testing.T) {
 	storage := &nativeDoltStorageSpy{
 		getReadyWork: func(_ context.Context, filter beadslib.WorkFilter) ([]*beadslib.Issue, error) {

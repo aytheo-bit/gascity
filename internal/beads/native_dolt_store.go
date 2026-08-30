@@ -781,6 +781,9 @@ func (s *NativeDoltStore) SetMetadata(id, key, value string) error {
 
 // SetMetadataBatch sets multiple metadata keys on a bead.
 func (s *NativeDoltStore) SetMetadataBatch(id string, kvs map[string]string) error {
+	if len(kvs) == 0 {
+		return nil
+	}
 	storage, release, err := s.acquireStorage()
 	if err != nil {
 		return err
@@ -795,19 +798,9 @@ func (s *NativeDoltStore) SetMetadataBatch(id string, kvs map[string]string) err
 	if issue == nil {
 		return fmt.Errorf("bead %q: %w", id, ErrNotFound)
 	}
-	metadata, err := metadataMapFromNative(issue.Metadata)
+	raw, err := mergeNativeMetadataStringValues(issue.Metadata, kvs)
 	if err != nil {
 		return fmt.Errorf("parsing metadata for bead %q: %w", id, err)
-	}
-	if metadata == nil {
-		metadata = make(map[string]string, len(kvs))
-	}
-	for k, v := range kvs {
-		metadata[k] = v
-	}
-	raw, err := metadataRawFromMap(metadata)
-	if err != nil {
-		return err
 	}
 	return nativeStoreError(id, storage.UpdateIssue(ctx, id, map[string]interface{}{"metadata": raw}, s.actor))
 }
@@ -950,19 +943,9 @@ func (s *NativeDoltStore) nativeUpdates(ctx context.Context, storage nativeIssue
 		if issue == nil {
 			return nil, fmt.Errorf("bead %q: %w", id, ErrNotFound)
 		}
-		metadata, err := metadataMapFromNative(issue.Metadata)
+		raw, err := mergeNativeMetadataStringValues(issue.Metadata, opts.Metadata)
 		if err != nil {
 			return nil, fmt.Errorf("parsing metadata for bead %q: %w", id, err)
-		}
-		if metadata == nil {
-			metadata = make(map[string]string, len(opts.Metadata))
-		}
-		for k, v := range opts.Metadata {
-			metadata[k] = v
-		}
-		raw, err := metadataRawFromMap(metadata)
-		if err != nil {
-			return nil, err
 		}
 		updates["metadata"] = raw
 	}
@@ -1415,6 +1398,32 @@ func zeroTimePtr(t time.Time) *time.Time {
 func metadataRawFromMap(metadata map[string]string) (json.RawMessage, error) {
 	if len(metadata) == 0 {
 		return nil, nil
+	}
+	raw, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling metadata: %w", err)
+	}
+	return raw, nil
+}
+
+// mergeNativeMetadataStringValues applies Gas City's string-valued metadata
+// updates without projecting unrelated native JSON values through
+// map[string]string. The native Beads store permits structured metadata, so a
+// route or lifecycle update must retain existing objects, arrays, numbers,
+// booleans, and nulls as their original JSON types.
+func mergeNativeMetadataStringValues(existing json.RawMessage, updates map[string]string) (json.RawMessage, error) {
+	metadata := make(map[string]json.RawMessage, len(updates))
+	if len(existing) > 0 && strings.TrimSpace(string(existing)) != "null" {
+		if err := json.Unmarshal(existing, &metadata); err != nil {
+			return nil, err
+		}
+	}
+	for key, value := range updates {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return nil, fmt.Errorf("marshaling metadata value %q: %w", key, err)
+		}
+		metadata[key] = raw
 	}
 	raw, err := json.Marshal(metadata)
 	if err != nil {
