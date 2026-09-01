@@ -593,6 +593,7 @@ func acceptWorkspaceTrustDialog(
 	peek func(lines int) (string, error),
 	sendKeys func(keys ...string) error,
 ) error {
+	claudeSelectionMoveSent := false
 	for budget.live() {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -603,7 +604,34 @@ func acceptWorkspaceTrustDialog(
 			return err
 		}
 
+		if containsClaudeWorkspaceTrustDialog(content) {
+			switch {
+			case containsUniqueClaudeWorkspaceTrustSelectedYes(content):
+				budget.observe()
+				if err := sendWorkspaceTrustDialogKeys(ctx, []string{"Enter"}, sendKeys); err != nil {
+					return err
+				}
+				return nil
+			case containsUniqueClaudeWorkspaceTrustSelectedNo(content):
+				if !claudeSelectionMoveSent {
+					budget.observe()
+					if err := sendKeys("Down"); err != nil {
+						return err
+					}
+					claudeSelectionMoveSent = true
+				}
+				sleep(ctx, dialogPollInterval)
+				continue
+			default:
+				sleep(ctx, dialogPollInterval)
+				continue
+			}
+		}
+
 		if containsWorkspaceTrustDialog(content) {
+			if claudeSelectionMoveSent {
+				return fmt.Errorf("Claude workspace trust dialog changed before a verified affirmative selection")
+			}
 			keys := workspaceTrustDialogKeys(content)
 			if len(keys) == 0 {
 				sleep(ctx, dialogPollInterval)
@@ -617,6 +645,9 @@ func acceptWorkspaceTrustDialog(
 		}
 
 		if containsPromptIndicator(content) {
+			if claudeSelectionMoveSent {
+				return fmt.Errorf("Claude workspace trust dialog advanced without a verified affirmative selection")
+			}
 			budget.observe()
 			return nil
 		}
@@ -627,11 +658,17 @@ func acceptWorkspaceTrustDialog(
 			strings.Contains(content, "Bypass Permissions mode") ||
 			containsCustomAPIKeyDialog(content) ||
 			ContainsRateLimitDialog(content) {
+			if claudeSelectionMoveSent {
+				return fmt.Errorf("Claude workspace trust dialog advanced without a verified affirmative selection")
+			}
 			budget.observe()
 			return nil
 		}
 
 		sleep(ctx, dialogPollInterval)
+	}
+	if claudeSelectionMoveSent {
+		return fmt.Errorf("Claude workspace trust selection did not visibly move to the affirmative option")
 	}
 	return nil
 }
@@ -642,13 +679,92 @@ func acceptWorkspaceTrustDialogFromStream(
 	snapshots *replayableSnapshotCursor,
 	sendKeys func(keys ...string) error,
 ) (bool, error) {
-	return acceptDialogFromStream(ctx, timeout, snapshots, sendKeys, streamDialogSpec{
-		match:        containsActionableWorkspaceTrustDialog,
-		matchKeysFor: workspaceTrustDialogKeys,
-		matchDelay:   startupDialogAcceptDelay,
-		ready:        containsReadyPromptOutsideWorkspaceTrust,
-		readyOrNext:  containsPostTrustStartupDialog,
-	})
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	observed := false
+	claudeSelectionMoveSent := false
+	var idleTimer *time.Timer
+	var idleDeadline <-chan time.Time
+	defer func() {
+		if idleTimer != nil {
+			idleTimer.Stop()
+		}
+	}()
+	stopIdleTimer := func() {
+		if idleTimer == nil {
+			return
+		}
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleDeadline = nil
+	}
+
+	for {
+		history, closed, updated := snapshots.nextBatch()
+		if len(history) > 0 {
+			for idx, content := range history {
+				switch {
+				case containsUniqueClaudeWorkspaceTrustSelectedYes(content):
+					observed = true
+					stopIdleTimer()
+					snapshots.replay(history[idx+1:])
+					return true, sendDialogKeys(ctx, sendKeys, []string{"Enter"}, startupDialogAcceptDelay)
+				case containsUniqueClaudeWorkspaceTrustSelectedNo(content):
+					observed = true
+					stopIdleTimer()
+					if !claudeSelectionMoveSent {
+						if err := sendKeys("Down"); err != nil {
+							return true, err
+						}
+						claudeSelectionMoveSent = true
+					}
+					continue
+				case containsClaudeWorkspaceTrustDialog(content):
+					observed = true
+					stopIdleTimer()
+					continue
+				case containsWorkspaceTrustDialog(content):
+					observed = true
+					stopIdleTimer()
+					snapshots.replay(history[idx+1:])
+					return true, sendDialogKeys(ctx, sendKeys, []string{"Enter"}, startupDialogAcceptDelay)
+				case containsPostTrustStartupDialog(content) || containsReadyPromptOutsideWorkspaceTrust(content):
+					if claudeSelectionMoveSent {
+						return true, fmt.Errorf("Claude workspace trust dialog advanced without a verified affirmative selection")
+					}
+					snapshots.replay(history[idx:])
+					return true, nil
+				}
+			}
+			if idleTimer == nil && !observed && startupDialogStreamIdleGrace > 0 {
+				idleTimer = time.NewTimer(startupDialogStreamIdleGrace)
+				idleDeadline = idleTimer.C
+			}
+		}
+		if closed {
+			if claudeSelectionMoveSent {
+				return true, fmt.Errorf("Claude workspace trust stream closed before the affirmative selection was visible")
+			}
+			return observed, nil
+		}
+		select {
+		case <-ctx.Done():
+			return observed, ctx.Err()
+		case <-timer.C:
+			if claudeSelectionMoveSent {
+				return true, fmt.Errorf("Claude workspace trust selection did not visibly move to the affirmative option")
+			}
+			return observed, nil
+		case <-idleDeadline:
+			return observed, nil
+		case <-updated:
+		}
+	}
 }
 
 func containsReadyPromptOutsideWorkspaceTrust(content string) bool {
@@ -661,21 +777,22 @@ func containsClaudeWorkspaceTrustDialog(content string) bool {
 		strings.Contains(content, "Do you trust this folder?")
 }
 
+func containsUniqueClaudeWorkspaceTrustSelectedNo(content string) bool {
+	return strings.Contains(content, "❯ No, exit") &&
+		strings.Contains(content, "Yes, I trust this folder") &&
+		!strings.Contains(content, "❯ Yes, I trust this folder")
+}
+
+func containsUniqueClaudeWorkspaceTrustSelectedYes(content string) bool {
+	return strings.Contains(content, "❯ Yes, I trust this folder") &&
+		!strings.Contains(content, "❯ No, exit")
+}
+
 func workspaceTrustDialogKeys(content string) []string {
-	if strings.Contains(content, "❯ No, exit") && strings.Contains(content, "Yes, I trust this folder") {
-		return []string{"Down", "Enter"}
-	}
-	if strings.Contains(content, "❯ Yes, I trust this folder") {
-		return []string{"Enter"}
-	}
 	if containsClaudeWorkspaceTrustDialog(content) {
 		return nil
 	}
 	return []string{"Enter"}
-}
-
-func containsActionableWorkspaceTrustDialog(content string) bool {
-	return containsWorkspaceTrustDialog(content) && len(workspaceTrustDialogKeys(content)) > 0
 }
 
 func sendWorkspaceTrustDialogKeys(

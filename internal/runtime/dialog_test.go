@@ -116,6 +116,9 @@ func TestAcceptStartupDialogsSelectsClaudeTrustAffirmative(t *testing.T) {
 			if len(sent) == 0 {
 				return "Quick safety check\n\n❯ No, exit\n  Yes, I trust this folder\n\nEnter to confirm", nil
 			}
+			if len(sent) == 1 {
+				return "Quick safety check\n\n  No, exit\n❯ Yes, I trust this folder\n\nEnter to confirm", nil
+			}
 			return "❯", nil
 		},
 		func(keys ...string) error {
@@ -167,6 +170,9 @@ func TestAcceptStartupDialogsWaitsForClaudeTrustCursor(t *testing.T) {
 			if peekCount == 1 {
 				return "Quick safety check\nNo, exit\nYes, I trust this folder", nil
 			}
+			if len(sent) == 1 {
+				return "Quick safety check\n  No, exit\n❯ Yes, I trust this folder", nil
+			}
 			return "Quick safety check\n❯ No, exit\n  Yes, I trust this folder", nil
 		},
 		func(keys ...string) error {
@@ -182,6 +188,96 @@ func TestAcceptStartupDialogsWaitsForClaudeTrustCursor(t *testing.T) {
 	}
 	if !reflect.DeepEqual(sent, []string{"Down", "Enter"}) {
 		t.Fatalf("sent keys = %v, want [Down Enter]", sent)
+	}
+}
+
+func TestAcceptStartupDialogsDoesNotConfirmClaudeTrustUntilAffirmativeSelectionIsVisible(t *testing.T) {
+	withZeroDialogTimings(t)
+	dialogPollInterval = time.Millisecond
+	dialogPollTimeout = 20 * time.Millisecond
+
+	var sent []string
+	err := AcceptStartupDialogs(
+		context.Background(),
+		func(_ int) (string, error) {
+			return "Quick safety check\n❯ No, exit\n  Yes, I trust this folder", nil
+		},
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "did not visibly move") {
+		t.Fatalf("AcceptStartupDialogs() error = %v, want visible-selection timeout", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Down"}) {
+		t.Fatalf("sent keys = %v, want [Down] with no Enter", sent)
+	}
+}
+
+func TestAcceptStartupDialogsIgnoresAmbiguousStaleClaudeTrustSnapshot(t *testing.T) {
+	withZeroDialogTimings(t)
+	dialogPollTimeout = time.Second
+
+	var sent []string
+	peekCount := 0
+	ambiguousReturned := false
+	err := AcceptStartupDialogs(
+		context.Background(),
+		func(_ int) (string, error) {
+			peekCount++
+			if len(sent) == 0 {
+				return "Quick safety check\n❯ No, exit\n  Yes, I trust this folder", nil
+			}
+			if !ambiguousReturned {
+				ambiguousReturned = true
+				return "Quick safety check\n❯ No, exit\n  Yes, I trust this folder\n❯ Yes, I trust this folder", nil
+			}
+			return "Quick safety check\n  No, exit\n❯ Yes, I trust this folder", nil
+		},
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogs() error = %v", err)
+	}
+	if peekCount < 3 {
+		t.Fatalf("peek count = %d, want ambiguous snapshot followed by a fresh selected-Yes snapshot", peekCount)
+	}
+	if !reflect.DeepEqual(sent, []string{"Down", "Enter"}) {
+		t.Fatalf("sent keys = %v, want [Down Enter]", sent)
+	}
+}
+
+func TestAcceptStartupDialogsRejectsPostTrustAdvanceWithoutVisibleAffirmativeSelection(t *testing.T) {
+	for _, next := range []string{"❯", "Bypass Permissions mode"} {
+		t.Run(next, func(t *testing.T) {
+			withZeroDialogTimings(t)
+			dialogPollTimeout = time.Second
+
+			var sent []string
+			err := AcceptStartupDialogs(
+				context.Background(),
+				func(_ int) (string, error) {
+					if len(sent) == 0 {
+						return "Quick safety check\n❯ No, exit\n  Yes, I trust this folder", nil
+					}
+					return next, nil
+				},
+				func(keys ...string) error {
+					sent = append(sent, keys...)
+					return nil
+				},
+			)
+			if err == nil || !strings.Contains(err.Error(), "advanced without a verified affirmative selection") {
+				t.Fatalf("AcceptStartupDialogs() error = %v, want unverified-advance failure", err)
+			}
+			if !reflect.DeepEqual(sent, []string{"Down"}) {
+				t.Fatalf("sent keys = %v, want [Down] with no Enter", sent)
+			}
+		})
 	}
 }
 
@@ -1052,10 +1148,11 @@ func TestAcceptStartupDialogsFromStreamAcceptsTrustDialog(t *testing.T) {
 	}
 }
 
-func TestAcceptStartupDialogsFromStreamSelectsClaudeTrustAffirmative(t *testing.T) {
+func TestAcceptStartupDialogsFromStreamSelectsClaudeTrustAffirmativeAfterVisibleTransition(t *testing.T) {
 	var sent []string
-	snapshots := make(chan string, 2)
+	snapshots := make(chan string, 3)
 	snapshots <- "Quick safety check\n\n❯ No, exit\n  Yes, I trust this folder"
+	snapshots <- "Quick safety check\n\n  No, exit\n❯ Yes, I trust this folder"
 	snapshots <- "❯"
 	close(snapshots)
 
@@ -1063,6 +1160,52 @@ func TestAcceptStartupDialogsFromStreamSelectsClaudeTrustAffirmative(t *testing.
 		context.Background(),
 		time.Second,
 		snapshots,
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("AcceptStartupDialogsFromStream() error = %v", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Down", "Enter"}) {
+		t.Fatalf("sent keys = %v, want [Down Enter]", sent)
+	}
+}
+
+func TestAcceptStartupDialogsFromStreamDoesNotConfirmBeforeAffirmativeSelectionIsVisible(t *testing.T) {
+	var sent []string
+	snapshots := make(chan string, 2)
+	snapshots <- "Quick safety check\n❯ No, exit\n  Yes, I trust this folder"
+	snapshots <- "Quick safety check\n❯ No, exit\n  Yes, I trust this folder"
+	close(snapshots)
+
+	err := AcceptStartupDialogsFromStream(
+		context.Background(), time.Second, snapshots,
+		func(keys ...string) error {
+			sent = append(sent, keys...)
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "closed before the affirmative selection") {
+		t.Fatalf("AcceptStartupDialogsFromStream() error = %v, want visible-selection failure", err)
+	}
+	if !reflect.DeepEqual(sent, []string{"Down"}) {
+		t.Fatalf("sent keys = %v, want [Down] with no Enter", sent)
+	}
+}
+
+func TestAcceptStartupDialogsFromStreamIgnoresAmbiguousStaleClaudeTrustSnapshot(t *testing.T) {
+	var sent []string
+	snapshots := make(chan string, 4)
+	snapshots <- "Quick safety check\n❯ No, exit\n  Yes, I trust this folder"
+	snapshots <- "Quick safety check\n❯ No, exit\n  Yes, I trust this folder\n❯ Yes, I trust this folder"
+	snapshots <- "Quick safety check\n  No, exit\n❯ Yes, I trust this folder"
+	snapshots <- "❯"
+	close(snapshots)
+
+	err := AcceptStartupDialogsFromStream(
+		context.Background(), time.Second, snapshots,
 		func(keys ...string) error {
 			sent = append(sent, keys...)
 			return nil
@@ -1100,9 +1243,10 @@ func TestAcceptStartupDialogsFromStreamKeepsSelectedClaudeTrustAffirmative(t *te
 
 func TestAcceptStartupDialogsFromStreamWaitsForClaudeTrustCursor(t *testing.T) {
 	var sent []string
-	snapshots := make(chan string, 3)
+	snapshots := make(chan string, 4)
 	snapshots <- "Quick safety check\nNo, exit\nYes, I trust this folder"
 	snapshots <- "Quick safety check\n❯ No, exit\n  Yes, I trust this folder"
+	snapshots <- "Quick safety check\n  No, exit\n❯ Yes, I trust this folder"
 	snapshots <- "❯"
 	close(snapshots)
 
@@ -1123,9 +1267,10 @@ func TestAcceptStartupDialogsFromStreamWaitsForClaudeTrustCursor(t *testing.T) {
 
 func TestAcceptStartupDialogsFromStreamWaitsForCompleteClaudeTrustMenu(t *testing.T) {
 	var sent []string
-	snapshots := make(chan string, 3)
+	snapshots := make(chan string, 4)
 	snapshots <- "Quick safety check\n❯ No, exit"
 	snapshots <- "Quick safety check\n❯ No, exit\n  Yes, I trust this folder"
+	snapshots <- "Quick safety check\n  No, exit\n❯ Yes, I trust this folder"
 	snapshots <- "❯"
 	close(snapshots)
 
@@ -1510,6 +1655,7 @@ func TestPollsUntilDialogAppears(t *testing.T) {
 	dialogPollTimeout = time.Second
 
 	var peekCount atomic.Int32
+	var sent []string
 	err := AcceptStartupDialogs(
 		context.Background(),
 		func(_ int) (string, error) {
@@ -1517,9 +1663,13 @@ func TestPollsUntilDialogAppears(t *testing.T) {
 			if n < 3 {
 				return "starting up...", nil
 			}
+			if len(sent) == 1 {
+				return "Quick safety check\n  No, exit\n❯ Yes, I trust this folder", nil
+			}
 			return "Quick safety check\n❯ No, exit\n  Yes, I trust this folder", nil
 		},
-		func(...string) error {
+		func(keys ...string) error {
+			sent = append(sent, keys...)
 			return nil
 		},
 	)
@@ -1528,6 +1678,9 @@ func TestPollsUntilDialogAppears(t *testing.T) {
 	}
 	if got := peekCount.Load(); got < 3 {
 		t.Fatalf("peekCount = %d, want >= 3 (polled until dialog appeared)", got)
+	}
+	if !reflect.DeepEqual(sent, []string{"Down", "Enter"}) {
+		t.Fatalf("sent keys = %v, want [Down Enter]", sent)
 	}
 }
 
@@ -1765,6 +1918,7 @@ func TestAcceptStartupDialogsWithTimeoutRefreshesBudgetOnProgress(t *testing.T) 
 
 	var sent []string
 	start := time.Now()
+	var trustMoveSent bool
 	var trustAccepted time.Time
 	err := AcceptStartupDialogsWithTimeout(
 		context.Background(),
@@ -1773,6 +1927,9 @@ func TestAcceptStartupDialogsWithTimeoutRefreshesBudgetOnProgress(t *testing.T) 
 			if trustAccepted.IsZero() {
 				if time.Since(start) < renderDelay {
 					return "", nil // agent still booting: nothing on screen yet
+				}
+				if trustMoveSent {
+					return "Quick safety check\n  No, exit\n❯ Yes, I trust this folder", nil
 				}
 				return "Quick safety check\n❯ No, exit\n  Yes, I trust this folder", nil
 			}
@@ -1783,8 +1940,12 @@ func TestAcceptStartupDialogsWithTimeoutRefreshesBudgetOnProgress(t *testing.T) 
 		},
 		func(keys ...string) error {
 			sent = append(sent, keys...)
-			if keys[0] == "Enter" && trustAccepted.IsZero() {
-				trustAccepted = time.Now()
+			if trustAccepted.IsZero() {
+				if keys[0] == "Down" {
+					trustMoveSent = true
+				} else if keys[0] == "Enter" && trustMoveSent {
+					trustAccepted = time.Now()
+				}
 			}
 			return nil
 		},
