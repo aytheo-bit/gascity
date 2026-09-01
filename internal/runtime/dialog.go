@@ -584,8 +584,9 @@ func containsPostUpdateStartupDialog(content string) bool {
 // acceptWorkspaceTrustDialog dismisses workspace trust dialogs for supported
 // agents. Claude shows "Quick safety check"; Codex shows
 // "Do you trust the contents of this directory?"; pi (>= 0.79) shows
-// "Trust project folder?". In all cases the safe continue option is
-// pre-selected, so Enter accepts.
+// "Trust project folder?". Claude currently defaults to "No, exit", so its
+// affirmative option must be selected explicitly. Other supported providers
+// pre-select their safe continue option.
 func acceptWorkspaceTrustDialog(
 	ctx context.Context,
 	budget *startupDialogBudget,
@@ -603,11 +604,15 @@ func acceptWorkspaceTrustDialog(
 		}
 
 		if containsWorkspaceTrustDialog(content) {
+			keys := workspaceTrustDialogKeys(content)
+			if len(keys) == 0 {
+				sleep(ctx, dialogPollInterval)
+				continue
+			}
 			budget.observe()
-			if err := sendKeys("Enter"); err != nil {
+			if err := sendWorkspaceTrustDialogKeys(ctx, keys, sendKeys); err != nil {
 				return err
 			}
-			sleep(ctx, startupDialogAcceptDelay)
 			return nil
 		}
 
@@ -638,12 +643,60 @@ func acceptWorkspaceTrustDialogFromStream(
 	sendKeys func(keys ...string) error,
 ) (bool, error) {
 	return acceptDialogFromStream(ctx, timeout, snapshots, sendKeys, streamDialogSpec{
-		match:       containsWorkspaceTrustDialog,
-		matchKeys:   []string{"Enter"},
-		matchDelay:  startupDialogAcceptDelay,
-		ready:       containsPromptIndicator,
-		readyOrNext: containsPostTrustStartupDialog,
+		match:        containsActionableWorkspaceTrustDialog,
+		matchKeysFor: workspaceTrustDialogKeys,
+		matchDelay:   startupDialogAcceptDelay,
+		ready:        containsReadyPromptOutsideWorkspaceTrust,
+		readyOrNext:  containsPostTrustStartupDialog,
 	})
+}
+
+func containsReadyPromptOutsideWorkspaceTrust(content string) bool {
+	return !containsWorkspaceTrustDialog(content) && containsPromptIndicator(content)
+}
+
+func containsClaudeWorkspaceTrustDialog(content string) bool {
+	return strings.Contains(content, "Quick safety check") ||
+		strings.Contains(content, "Yes, I trust this folder") ||
+		strings.Contains(content, "Do you trust this folder?")
+}
+
+func workspaceTrustDialogKeys(content string) []string {
+	if strings.Contains(content, "❯ No, exit") && strings.Contains(content, "Yes, I trust this folder") {
+		return []string{"Down", "Enter"}
+	}
+	if strings.Contains(content, "❯ Yes, I trust this folder") {
+		return []string{"Enter"}
+	}
+	if containsClaudeWorkspaceTrustDialog(content) {
+		return nil
+	}
+	return []string{"Enter"}
+}
+
+func containsActionableWorkspaceTrustDialog(content string) bool {
+	return containsWorkspaceTrustDialog(content) && len(workspaceTrustDialogKeys(content)) > 0
+}
+
+func sendWorkspaceTrustDialogKeys(
+	ctx context.Context,
+	keys []string,
+	sendKeys func(keys ...string) error,
+) error {
+	for index, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := sendKeys(key); err != nil {
+			return err
+		}
+		if index < len(keys)-1 {
+			sleep(ctx, bypassDialogConfirmDelay)
+		} else {
+			sleep(ctx, startupDialogAcceptDelay)
+		}
+	}
+	return ctx.Err()
 }
 
 func containsWorkspaceTrustDialog(content string) bool {
@@ -1184,11 +1237,12 @@ func dismissRateLimitDialogFromStream(
 }
 
 type streamDialogSpec struct {
-	match       func(string) bool
-	ready       func(string) bool
-	readyOrNext func(string) bool
-	matchKeys   []string
-	matchDelay  time.Duration
+	match        func(string) bool
+	ready        func(string) bool
+	readyOrNext  func(string) bool
+	matchKeys    []string
+	matchKeysFor func(string) []string
+	matchDelay   time.Duration
 }
 
 type replayableSnapshotStream struct {
@@ -1326,7 +1380,11 @@ func acceptDialogFromStream(
 			for idx, content := range history {
 				if spec.match != nil && spec.match(content) {
 					snapshots.replay(history[idx+1:])
-					return true, sendDialogKeys(ctx, sendKeys, spec.matchKeys, spec.matchDelay)
+					keys := spec.matchKeys
+					if spec.matchKeysFor != nil {
+						keys = spec.matchKeysFor(content)
+					}
+					return true, sendDialogKeys(ctx, sendKeys, keys, spec.matchDelay)
 				}
 				if spec.readyOrNext != nil && spec.readyOrNext(content) {
 					snapshots.replay(history[idx:])
