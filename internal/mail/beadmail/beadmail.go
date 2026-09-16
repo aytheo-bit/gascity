@@ -10,6 +10,7 @@ package beadmail
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/humantrust"
 	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/session"
 )
@@ -153,16 +155,38 @@ func (c *sessionInfoCache) isFresh(now time.Time) bool {
 // Returns an error if to is empty: blank recipients produce messages that never
 // appear in any inbox but still inflate global counts.
 func (p *Provider) Send(from, to, subject, body string) (mail.Message, error) {
-	return p.send(from, to, subject, body, "")
+	return p.send(from, to, subject, body, "", nil)
 }
 
 // SendWithProvenance is [Provider.Send] plus an independently-sourced
 // createdBy actor. See [mail.ProvenanceRecorder].
 func (p *Provider) SendWithProvenance(from, to, subject, body, createdBy string) (mail.Message, error) {
-	return p.send(from, to, subject, body, createdBy)
+	return p.send(from, to, subject, body, createdBy, nil)
 }
 
-func (p *Provider) send(from, to, subject, body, createdBy string) (mail.Message, error) {
+// SendSigned is [Provider.Send] plus a cryptographic signature over
+// (from, to, body, issuedAt) — see [mail.SignedSender]. from must be a
+// reserved identity ("human" or "controller"); SendSigned refuses anything
+// else, since signing ordinary session mail has no defined meaning here.
+// The signature is stored verbatim as message metadata; beadToMessage
+// re-verifies it against the message's own stored content on every read, so
+// this method never has to be (and is not) trusted blindly by a reader.
+func (p *Provider) SendSigned(from, to, subject, body string, signature []byte, issuedAt time.Time) (mail.Message, error) {
+	if from != mail.ReservedIdentityHuman && from != mail.ReservedIdentityController {
+		return mail.Message{}, fmt.Errorf("beadmail send-signed: signing is only defined for reserved identities (%q, %q), not %q", mail.ReservedIdentityHuman, mail.ReservedIdentityController, from)
+	}
+	if len(signature) == 0 {
+		return mail.Message{}, fmt.Errorf("beadmail send-signed: empty signature")
+	}
+	extra := map[string]string{
+		mail.VerifiedIdentityMetadataKey:  from,
+		mail.VerifiedSignatureMetadataKey: base64.StdEncoding.EncodeToString(signature),
+		mail.VerifiedIssuedAtMetadataKey:  issuedAt.UTC().Format(time.RFC3339Nano),
+	}
+	return p.send(from, to, subject, body, "", extra)
+}
+
+func (p *Provider) send(from, to, subject, body, createdBy string, extraMetadata map[string]string) (mail.Message, error) {
 	if to == "" {
 		return mail.Message{}, fmt.Errorf("beadmail send: recipient is required")
 	}
@@ -171,6 +195,7 @@ func (p *Provider) send(from, to, subject, body, createdBy string) (mail.Message
 		return mail.Message{}, fmt.Errorf("beadmail send: %w", err)
 	}
 	metadata = withCreatedBy(metadata, createdBy)
+	metadata = withExtraMetadata(metadata, extraMetadata)
 	threadID := generateThreadID()
 	labels := []string{"thread:" + threadID}
 
@@ -187,6 +212,23 @@ func (p *Provider) send(from, to, subject, body, createdBy string) (mail.Message
 		return mail.Message{}, fmt.Errorf("beadmail send: %w", err)
 	}
 	return beadToMessage(b), nil
+}
+
+// withExtraMetadata merges extra into metadata, allocating a map only when
+// needed. extra wins on key collision (there are none in practice: extra
+// only ever carries the mail.Verified* keys, which withCreatedBy never
+// writes).
+func withExtraMetadata(metadata, extra map[string]string) map[string]string {
+	if len(extra) == 0 {
+		return metadata
+	}
+	if metadata == nil {
+		metadata = make(map[string]string, len(extra))
+	}
+	for k, v := range extra {
+		metadata[k] = v
+	}
+	return metadata
 }
 
 // withCreatedBy adds [createdByMetadataKey] to metadata when the caller
@@ -1276,19 +1318,73 @@ func beadToMessage(b beads.Bead) mail.Message {
 	case "false":
 		read = false
 	}
+	verified, verifiedIdentity := verifySignedMetadata(b)
 	return mail.Message{
-		ID:        b.ID,
-		From:      from,
-		To:        to,
-		Subject:   b.Title,
-		Body:      b.Description,
-		CreatedAt: b.CreatedAt,
-		Read:      read,
-		ThreadID:  extractLabel(b.Labels, "thread:"),
-		ReplyTo:   extractLabel(b.Labels, "reply-to:"),
-		Priority:  extractPriority(b.Labels),
-		CC:        extractCC(b.Labels),
+		ID:               b.ID,
+		From:             from,
+		To:               to,
+		Subject:          b.Title,
+		Body:             b.Description,
+		CreatedAt:        b.CreatedAt,
+		Read:             read,
+		ThreadID:         extractLabel(b.Labels, "thread:"),
+		ReplyTo:          extractLabel(b.Labels, "reply-to:"),
+		Priority:         extractPriority(b.Labels),
+		CC:               extractCC(b.Labels),
+		Verified:         verified,
+		VerifiedIdentity: verifiedIdentity,
 	}
+}
+
+// verifySignedMetadata independently re-derives whether b carries a valid
+// [mail.SignedSender] signature, using only the message's OWN current
+// content (b.From, b.Assignee, b.Description) and the trusted public key —
+// never the metadata's own say-so. This is what makes Verified trustworthy
+// for a reader that does not (and must not) hold the private signing key:
+// checking is cheap (one Ed25519 verify plus a public-key file read) and
+// requires no secret.
+//
+// Every failure mode (missing metadata, identity/From mismatch, malformed
+// base64/timestamp, no trust key provisioned on this host, expired or
+// forged signature) reports unverified rather than erroring, matching the
+// existing behavior for every message before this mechanism existed: a
+// message that cannot be proven verified is treated exactly as skeptically
+// as an ordinary unsigned message, never worse and never silently upgraded.
+func verifySignedMetadata(b beads.Bead) (verified bool, identity string) {
+	if b.Metadata == nil {
+		return false, ""
+	}
+	claimedIdentity := strings.TrimSpace(b.Metadata[mail.VerifiedIdentityMetadataKey])
+	sigB64 := strings.TrimSpace(b.Metadata[mail.VerifiedSignatureMetadataKey])
+	issuedAtStr := strings.TrimSpace(b.Metadata[mail.VerifiedIssuedAtMetadataKey])
+	if claimedIdentity == "" || sigB64 == "" || issuedAtStr == "" {
+		return false, ""
+	}
+	// The claimed identity must match the message's actual From exactly —
+	// otherwise a message could carry a stale/foreign signature's metadata
+	// while displaying a different sender.
+	if claimedIdentity != b.From {
+		return false, ""
+	}
+	sig, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil {
+		return false, ""
+	}
+	issuedAt, err := time.Parse(time.RFC3339Nano, issuedAtStr)
+	if err != nil {
+		return false, ""
+	}
+	pub, err := humantrust.LoadPublicKey()
+	if err != nil {
+		// No trust key provisioned on this host (or unreadable) — cannot
+		// verify anything, so nothing verifies. This is not an error
+		// condition for ordinary mail reading.
+		return false, ""
+	}
+	if !humantrust.Verify(pub, claimedIdentity, b.Assignee, b.Description, issuedAt, sig) {
+		return false, ""
+	}
+	return true, claimedIdentity
 }
 
 // hasLabel reports whether labels contains the target string.
@@ -1343,5 +1439,8 @@ func generateThreadID() string {
 	return fmt.Sprintf("thread-%x", b)
 }
 
-// Compile-time interface check.
-var _ mail.Provider = (*Provider)(nil)
+// Compile-time interface checks.
+var (
+	_ mail.Provider     = (*Provider)(nil)
+	_ mail.SignedSender = (*Provider)(nil)
+)

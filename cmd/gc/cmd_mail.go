@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"text/tabwriter"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/extmsg"
+	"github.com/gastownhall/gascity/internal/humantrust"
 	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/session"
@@ -84,12 +86,14 @@ type mailActionResult struct {
 }
 
 type mailMessageSummary struct {
-	ID       string `json:"id"`
-	From     string `json:"from,omitempty"`
-	To       string `json:"to,omitempty"`
-	Subject  string `json:"subject,omitempty"`
-	ThreadID string `json:"thread_id,omitempty"`
-	ReplyTo  string `json:"reply_to,omitempty"`
+	ID               string `json:"id"`
+	From             string `json:"from,omitempty"`
+	To               string `json:"to,omitempty"`
+	Subject          string `json:"subject,omitempty"`
+	ThreadID         string `json:"thread_id,omitempty"`
+	ReplyTo          string `json:"reply_to,omitempty"`
+	Verified         bool   `json:"verified,omitempty"`
+	VerifiedIdentity string `json:"verified_identity,omitempty"`
 }
 
 type mailArchiveSelectOptions struct {
@@ -107,12 +111,14 @@ type mailArchiveSelectOptions struct {
 
 func summarizeMailMessage(m mail.Message) mailMessageSummary {
 	return mailMessageSummary{
-		ID:       m.ID,
-		From:     m.From,
-		To:       m.To,
-		Subject:  m.Subject,
-		ThreadID: m.ThreadID,
-		ReplyTo:  m.ReplyTo,
+		ID:               m.ID,
+		From:             m.From,
+		To:               m.To,
+		Subject:          m.Subject,
+		ThreadID:         m.ThreadID,
+		ReplyTo:          m.ReplyTo,
+		Verified:         m.Verified,
+		VerifiedIdentity: m.VerifiedIdentity,
 	}
 }
 
@@ -138,7 +144,7 @@ hooks to deliver mail notifications into agent prompts.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			if len(args) == 0 {
-				fmt.Fprintln(stderr, "gc mail: missing subcommand (archive, check, count, delete, inbox, mark-read, mark-unread, peek, read, reply, send, thread)") //nolint:errcheck // best-effort stderr
+				fmt.Fprintln(stderr, "gc mail: missing subcommand (archive, check, count, delete, inbox, mark-read, mark-unread, peek, read, reply, send, thread, trust)") //nolint:errcheck // best-effort stderr
 			} else {
 				fmt.Fprintf(stderr, "gc mail: unknown subcommand %q\n", args[0]) //nolint:errcheck // best-effort stderr
 			}
@@ -158,6 +164,7 @@ hooks to deliver mail notifications into agent prompts.`,
 		newMailReadCmd(stdout, stderr),
 		newMailReplyCmd(stdout, stderr),
 		newMailThreadCmd(stdout, stderr),
+		newMailTrustCmd(stdout, stderr),
 	)
 	return cmd
 }
@@ -831,6 +838,18 @@ func formatInjectOutput(messages []mail.Message) string {
 		// Without this, a sender can inject </system-reminder> sequences
 		// and break out of the reminder. See gastownhall/gascity#2195.
 		from := extmsg.SanitizeForSystemReminder(m.From)
+		// verifiedMarker is server-computed (beadmail re-derives Verified from
+		// the message's own content against the operator trust key on every
+		// read — see beadmail.verifySignedMetadata), never attacker text, so
+		// it needs no sanitization. An ordinary "from human"/"from controller"
+		// claim — including every message sent before this mechanism existed,
+		// and any --from human/--from controller sent without --sign — never
+		// carries this marker and must be read exactly as skeptically as
+		// before: a caller-supplied claim, not verified evidence.
+		verifiedMarker := ""
+		if m.Verified && m.VerifiedIdentity != "" {
+			verifiedMarker = fmt.Sprintf(" [cryptographically verified %s sender]", m.VerifiedIdentity)
+		}
 		rawSubject, subjectTruncated := mailInjectSubjectPreview(m.Subject)
 		subject := extmsg.SanitizeForSystemReminder(rawSubject)
 		rawBody, bodyTruncated := mailInjectBodyPreview(m.Body)
@@ -846,13 +865,13 @@ func formatInjectOutput(messages []mail.Message) string {
 			body, bodyTruncated = subject, subjectTruncated
 		}
 		if subject != "" && subject != body {
-			fmt.Fprintf(&sb, "- %s from %s [%s", m.ID, from, subject)
+			fmt.Fprintf(&sb, "- %s from %s%s [%s", m.ID, from, verifiedMarker, subject)
 			if subjectTruncated {
 				sb.WriteString(" ... [subject truncated]")
 			}
 			fmt.Fprintf(&sb, "]: %s", body)
 		} else {
-			fmt.Fprintf(&sb, "- %s from %s: %s", m.ID, from, body)
+			fmt.Fprintf(&sb, "- %s from %s%s: %s", m.ID, from, verifiedMarker, body)
 		}
 		if bodyTruncated {
 			sb.WriteString(" ... [preview truncated]")
@@ -1001,14 +1020,35 @@ func reservedIdentityEnvClaim() (key string, claimed bool) {
 	return "", false
 }
 
-// refuseUnauthenticatedHumanSender decides whether a mail sender that resolved
-// to "human" must be refused as an unauthenticated impersonation attempt,
-// closing the gap behind the ga fabricated-authority incident: a session used
-// "gc mail send --from human ..." (and, more subtly, a session whose
-// GC_AGENT/GC_ALIAS was set to the literal string "human") to make its own
-// outgoing mail read as an authenticated escalation from the real human
-// operator, with nothing in the message distinguishing it from the genuine
-// article afterward.
+// isReservedMailIdentity reports whether sender is one of the reserved names
+// ("human" or "controller") this gate and [humantrust]-based signing apply
+// to. Callers must check this against the FINAL resolved sender — never the
+// raw --from string — since resolveMailIdentityWithConfigCached is what
+// actually decides a claim resolves to a reserved identity in the first
+// place.
+func isReservedMailIdentity(sender string) bool {
+	return sender == mail.ReservedIdentityHuman || sender == controllerMailIdentity
+}
+
+// refuseUnauthenticatedHumanSender decides whether a mail sender that
+// resolved to a reserved identity ("human" or "controller") must be refused
+// as an unauthenticated impersonation attempt, closing the gap behind the ga
+// fabricated-authority incident: a session used "gc mail send --from human
+// ..." (and, more subtly, a session whose GC_AGENT/GC_ALIAS was set to the
+// literal string "human") to make its own outgoing mail read as an
+// authenticated escalation from the real human operator, with nothing in the
+// message distinguishing it from the genuine article afterward.
+//
+// GENERALIZATION NOTE: earlier revisions of this function, and every call
+// site, checked literally `sender == "human"` and never considered
+// "controller" — meaning a managed session (with its OWN real
+// GC_SESSION_ID, no env-stripping required at all) could run
+// `gc mail send --from controller ...` and sail through completely
+// unrefused, a strictly worse and simpler bypass than the documented
+// env-strip limitation below. sender is now the actual resolved identity,
+// and every call site gates on [isReservedMailIdentity](sender) instead of a
+// literal "human" comparison, so this function is reached — and applies the
+// same reasoning — for both reserved names.
 //
 // Gas City has no channel today that lets a real human operator authenticate a
 // "from human" claim — mail is documented untrusted data
@@ -1057,19 +1097,24 @@ func reservedIdentityEnvClaim() (key string, claimed bool) {
 // forge-proof check is real infrastructure work beyond this fix's scope.
 //
 // This function is therefore defense-in-depth against careless or naive
-// misuse — a session that types --from human without thinking, or whose
-// GC_AGENT happens to be set to the literal "human" — not a boundary that
-// withstands a determined adversary who knows to strip their own
-// environment. Treat [CreatedByMetadataKey] the same way: it is a same-
-// trust-domain breadcrumb, not independent verification. See
+// misuse — a session that types --from human (or --from controller) without
+// thinking, or whose GC_AGENT happens to be set to one of those literal
+// strings — not a boundary that withstands a determined adversary who knows
+// to strip their own environment, and NOT a substitute for
+// gc mail send --sign (see internal/humantrust), which is the actual
+// forge-proof mechanism: this function has no way to distinguish a genuinely
+// unmanaged human shell from a session that stripped its own env, but
+// --sign's private key is never in that session's reach regardless of what
+// its environment claims. Treat [CreatedByMetadataKey] the same way: it is a
+// same-trust-domain breadcrumb, not independent verification. See
 // TestCmdMailSendKnownLimitationEnvStripBypassesHumanGate for the pinned,
 // intentionally-unclosed regression case.
-func refuseUnauthenticatedHumanSender(explicitFrom bool) (refuse bool, reason string) {
+func refuseUnauthenticatedHumanSender(sender string, explicitFrom bool) (refuse bool, reason string) {
 	if key, claimed := reservedIdentityEnvClaim(); claimed {
-		return true, fmt.Sprintf("refusing to send as %q: %s is set to a reserved sender identity, which a managed session may never claim", "human", key)
+		return true, fmt.Sprintf("refusing to send as %q: %s is set to a reserved sender identity, which a managed session may never claim", sender, key)
 	}
 	if explicitFrom && ambientManagedSession() {
-		return true, "refusing --from human: this process has a managed session identity (GC_SESSION_ID, GC_ALIAS, or GC_AGENT is set) and may not send mail claiming to be the human operator"
+		return true, fmt.Sprintf("refusing --from %s: this process has a managed session identity (GC_SESSION_ID, GC_ALIAS, or GC_AGENT is set) and may not send mail claiming to be the %s operator/orchestrator", sender, sender)
 	}
 	return false, ""
 }
@@ -1510,11 +1555,11 @@ func resolveDefaultMailSenderForCommandCached(cityPath string, cfg *config.City,
 		sender, err := resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, c, cache)
 		if err == nil {
 			// This resolver only ever runs the implicit (no --from) path, so
-			// explicitFrom is always false here; an explicit "--from human" on
-			// gc mail send is refused separately, at that call site, because
-			// this function is never reached for it.
-			if sender == "human" {
-				if refuse, reason := refuseUnauthenticatedHumanSender(false); refuse {
+			// explicitFrom is always false here; an explicit "--from human" (or
+			// "--from controller") on gc mail send is refused separately, at
+			// that call site, because this function is never reached for it.
+			if isReservedMailIdentity(sender) {
+				if refuse, reason := refuseUnauthenticatedHumanSender(sender, false); refuse {
 					fmt.Fprintf(stderr, "%s: %s\n", cmdName, reason) //nolint:errcheck // best-effort stderr
 					return "", false
 				}
@@ -1643,6 +1688,7 @@ func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
 	var subject string
 	var message string
 	var jsonOut bool
+	var sign bool
 	cmd := &cobra.Command{
 		Use:   "send [<to>] [<body>]",
 		Short: "Send a message to a session alias or human",
@@ -1673,12 +1719,7 @@ Use --all to broadcast to all live sessions (excluding sender and "human").`,
   gc mail send --all "Status update: tests passing"`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
-			code := 0
-			if jsonOut {
-				code = cmdMailSendJSON(args, notify, all, from, to, subject, message, true, stdout, stderr)
-			} else {
-				code = cmdMailSend(args, notify, all, from, to, subject, message, stdout, stderr)
-			}
+			code := cmdMailSendJSONWithSign(args, notify, all, from, to, subject, message, jsonOut, sign, stdout, stderr)
 			if code != 0 {
 				return errExit
 			}
@@ -1694,6 +1735,7 @@ Use --all to broadcast to all live sessions (excluding sender and "human").`,
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "message subject line")
 	cmd.Flags().StringVarP(&message, "message", "m", "", "message body text")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSONL result")
+	cmd.Flags().BoolVar(&sign, "sign", false, "cryptographically sign this reserved-identity (human/controller) send with the operator-only trust key (see 'gc mail trust init'); refused when this process has a managed-session identity or no trust key is provisioned")
 	cmd.MarkFlagsMutuallyExclusive("to", "all")
 	return cmd
 }
@@ -1918,6 +1960,21 @@ func cmdMailSend(args []string, notify bool, all bool, from string, to string, s
 }
 
 func cmdMailSendJSON(args []string, notify bool, all bool, from string, to string, subject string, message string, jsonOut bool, stdout, stderr io.Writer) int {
+	return cmdMailSendJSONWithSign(args, notify, all, from, to, subject, message, jsonOut, false, stdout, stderr)
+}
+
+// cmdMailSendJSONWithSign is cmdMailSendJSON plus the --sign surface: when
+// sign is true, the send is refused unless (a) this process carries no
+// managed-session identity and (b) an operator trust key is loadable, and on
+// success the message is cryptographically bound to its sender identity,
+// recipient, and body via internal/humantrust — see prepareSignedSend.
+// sign=false (the default from cmdMailSendJSON/cmdMailSend) is byte-for-byte
+// the pre-existing, unsigned behavior.
+func cmdMailSendJSONWithSign(args []string, notify bool, all bool, from string, to string, subject string, message string, jsonOut bool, sign bool, stdout, stderr io.Writer) int {
+	if sign && all {
+		fmt.Fprintln(stderr, "gc mail send: --sign cannot be combined with --all (sign one addressed recipient at a time)") //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	mp, code := openCityMailProvider(stderr, "gc mail send")
 	if mp == nil {
 		return code
@@ -1978,8 +2035,8 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 			return 1
 		}
 	}
-	if sender == "human" {
-		if refuse, reason := refuseUnauthenticatedHumanSender(explicitFrom); refuse {
+	if isReservedMailIdentity(sender) {
+		if refuse, reason := refuseUnauthenticatedHumanSender(sender, explicitFrom); refuse {
 			fmt.Fprintf(stderr, "gc mail send: %s\n", reason) //nolint:errcheck // best-effort stderr
 			return 1
 		}
@@ -2033,7 +2090,42 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 	}
 
 	rec := openCityRecorder(stderr)
+	if sign {
+		return doMailSendSignedJSON(mp, rec, validRecipients, sender, args, nf, jsonOut, stdout, stderr)
+	}
 	return doMailSendJSON(mp, rec, validRecipients, sender, args, nf, jsonOut, stdout, stderr)
+}
+
+// prepareSignedSend loads everything a genuine --sign invocation needs and
+// refuses loudly, with an actionable reason, whenever it cannot: sign is
+// requested from a process with a managed-session identity, sender is not a
+// reserved identity, or no operator trust key is provisioned on this host.
+// It never falls back to an unsigned send — a caller that asked for --sign
+// and can't get it must see a failure, not a message that looks ordinary.
+func prepareSignedSend(sender string, stderr io.Writer) (signer func(to, body string) (signature []byte, issuedAt time.Time), ok bool) {
+	if sender != mail.ReservedIdentityHuman && sender != mail.ReservedIdentityController {
+		fmt.Fprintf(stderr, "gc mail send: --sign requires --from %s or --from %s (got %q)\n", mail.ReservedIdentityHuman, mail.ReservedIdentityController, sender) //nolint:errcheck // best-effort stderr
+		return nil, false
+	}
+	// Belt-and-suspenders, matching refuseUnauthenticatedHumanSender's style:
+	// a spawned session should never legitimately reach for --sign even if a
+	// trust key happened to be readable, because it should never BE the
+	// process holding the operator's private key. The real boundary is key
+	// possession (checked immediately below); this is defense-in-depth on
+	// top of it, not instead of it.
+	if ambientManagedSession() {
+		fmt.Fprintln(stderr, "gc mail send: refusing --sign: this process has a managed session identity (GC_SESSION_ID, GC_ALIAS, or GC_AGENT is set); only a genuinely unmanaged human terminal or an explicitly provisioned trust relay may sign") //nolint:errcheck // best-effort stderr
+		return nil, false
+	}
+	key, err := humantrust.LoadPrivateKey()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc mail send: --sign: %v; run 'gc mail trust init' from a genuine human terminal first\n", err) //nolint:errcheck // best-effort stderr
+		return nil, false
+	}
+	return func(to, body string) ([]byte, time.Time) {
+		issuedAt := time.Now()
+		return humantrust.Sign(key, sender, to, body, issuedAt), issuedAt
+	}, true
 }
 
 // doMailSend creates a message addressed to a recipient. args is [to, subject, body]
@@ -2083,6 +2175,87 @@ func doMailSendJSON(mp mail.Provider, rec events.Recorder, validRecipients map[s
 	}
 
 	// Nudge recipient if requested and recipient is not human.
+	notified := false
+	if nudgeFn != nil && to != "human" {
+		if err := nudgeFn(to, m.ID); err != nil {
+			fmt.Fprintf(stderr, "gc mail send: nudge failed: %v\n", err) //nolint:errcheck // best-effort stderr
+		} else {
+			notified = true
+		}
+	}
+	if jsonOut {
+		summary := summarizeMailMessage(m)
+		return writeCLIJSONLineOrExit(stdout, stderr, "gc mail send", mailActionResult{SchemaVersion: "1", OK: true, Command: "mail.send", Action: "send", ID: m.ID, Message: &summary, Messages: []mailMessageSummary{summary}, Count: intRef(1), Notified: notified})
+	}
+	return 0
+}
+
+// doMailSendSignedJSON is doMailSendJSON's --sign counterpart: single
+// recipient only (no --all), and the created message carries a signature
+// [mail.SendSigned] stores verbatim so later reads can independently
+// re-verify it (see beadmail.verifySignedMetadata) rather than trusting this
+// call's own success. Refuses outright — never falls back to an unsigned
+// send — when prepareSignedSend can't produce a signer (wrong/no reserved
+// sender, managed-session identity present, or no trust key provisioned) or
+// when the configured mail provider does not implement [mail.SignedSender]
+// (only the built-in beadmail provider does today; exec: and the HTTP API
+// send path do not — see docs/reference/trust-boundaries.md).
+func doMailSendSignedJSON(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, nudgeFn nudgeFunc, jsonOut bool, stdout, stderr io.Writer) int {
+	if len(args) < 2 {
+		fmt.Fprintln(stderr, "gc mail send: usage: gc mail send <to> <body> --sign  OR  gc mail send <to> -s <subject> [-m <body>] --sign") //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	to := args[0]
+
+	var subject, body string
+	if len(args) >= 3 {
+		subject = args[1]
+		body = args[2]
+	} else {
+		body = strings.Join(args[1:], " ")
+	}
+
+	if validRecipients != nil && !validRecipients[to] {
+		fmt.Fprintf(stderr, "gc mail send: unknown recipient %q\n", to) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+
+	signer, ok := prepareSignedSend(sender, stderr)
+	if !ok {
+		return 1
+	}
+	signature, issuedAt := signer(to, body)
+
+	m, supported, err := mail.SendSigned(mp, sender, to, subject, body, signature, issuedAt)
+	telemetry.RecordMailOp(context.Background(), "send", err)
+	if !supported {
+		fmt.Fprintf(stderr, "gc mail send: --sign is not supported by the configured mail provider (%q); only the built-in store-backed provider supports verified sends today\n", mailProviderName()) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if !m.Verified {
+		// Should be unreachable — SendSigned only returns success alongside
+		// content that beadToMessage's own verification confirms — but if a
+		// future provider implementation ever manages to return ok=true
+		// without a message that verifies, fail loudly rather than claim a
+		// signed send succeeded when the read side would disagree.
+		fmt.Fprintln(stderr, "gc mail send: --sign: provider reported success but the created message does not verify; refusing to report a signed send") //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	rec.Record(events.Event{
+		Type:    events.MailSent,
+		Actor:   m.From,
+		Subject: m.ID,
+		Message: to,
+		Payload: mailEventPayload(&m),
+	})
+	if !jsonOut {
+		fmt.Fprintf(stdout, "Sent verified message %s to %s (signed as %s)\n", m.ID, to, m.VerifiedIdentity) //nolint:errcheck // best-effort stdout
+	}
+
 	notified := false
 	if nudgeFn != nil && to != "human" {
 		if err := nudgeFn(to, m.ID); err != nil {
@@ -2447,10 +2620,10 @@ func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonO
 			}
 		}
 	}
-	if sender == "human" {
+	if isReservedMailIdentity(sender) {
 		// gc mail reply has no --from flag, so this can only be the implicit
 		// default-sender fallback — never an explicit claim.
-		if refuse, reason := refuseUnauthenticatedHumanSender(false); refuse {
+		if refuse, reason := refuseUnauthenticatedHumanSender(sender, false); refuse {
 			fmt.Fprintf(stderr, "gc mail reply: %s\n", reason) //nolint:errcheck // best-effort stderr
 			return 1
 		}

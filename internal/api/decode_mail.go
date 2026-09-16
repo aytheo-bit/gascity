@@ -52,6 +52,12 @@ func mailMessageFromGen(g genclient.Message) mail.Message {
 	if g.Rig != nil {
 		out.Rig = *g.Rig
 	}
+	if g.Verified != nil {
+		out.Verified = *g.Verified
+	}
+	if g.VerifiedIdentity != nil {
+		out.VerifiedIdentity = *g.VerifiedIdentity
+	}
 	return out
 }
 

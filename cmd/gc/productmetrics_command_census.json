@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "next_id": 207,
+  "next_id": 209,
   "permanent_ids": [
     {
       "name": "help",
@@ -2382,6 +2382,54 @@
       "classification": "mail-thread",
       "owner": "immediate",
       "id": 87
+    },
+    {
+      "path": "gc mail trust",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable-group",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "unknown",
+      "canonical_target": "@unknown",
+      "owner": "deferred",
+      "resolver": "group-dispatch",
+      "deferred_default": "unknown",
+      "id": 3
+    },
+    {
+      "path": "gc mail trust init",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "mail-trust-init",
+      "owner": "immediate",
+      "id": 207
+    },
+    {
+      "path": "gc mail trust show",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "mail-trust-show",
+      "owner": "immediate",
+      "id": 208
     },
     {
       "path": "gc maintenance",

@@ -2381,6 +2381,7 @@ gc mail
 | [gc mail reply](#gc-mail-reply) | Reply to a message |
 | [gc mail send](#gc-mail-send) | Send a message to a session alias or human |
 | [gc mail thread](#gc-mail-thread) | List all messages in a thread |
+| [gc mail trust](#gc-mail-trust) | Manage the operator-only key that signs verified-human/controller mail |
 
 ## gc mail archive
 
@@ -2562,7 +2563,15 @@ Creates a message bead addressed to the recipient. The sender defaults
 to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --notify to request
 a recipient turn after sending. In a managed city, it can request a wake for
 a non-running recipient. Unread mail alone does not request a wake.
-Use --from to override the sender identity.
+Use --from to override the sender identity. A managed session (any of
+$GC_SESSION_ID, $GC_ALIAS, $GC_AGENT set) is refused if it tries to send as
+"human" — neither via --from human nor by having one of those variables
+itself set to "human" — since nothing on this host can independently verify
+that claim; only a genuinely unmanaged shell may default to "human". This is
+a defense-in-depth guard against careless or naive misuse, not a hardened
+authentication boundary: a session that deliberately clears its own
+GC_SESSION_ID/GC_ALIAS/GC_AGENT before invoking gc is indistinguishable from
+an unmanaged shell and is not caught.
 Use --to as an alternative to the positional &lt;to&gt; argument.
 Use -s/--subject for the summary line and -m/--message for the body text.
 Use --all to broadcast to all live sessions (excluding sender and "human").
@@ -2586,10 +2595,11 @@ gc mail send --all "Status update: tests passing"
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--all` | bool |  | broadcast to all live sessions (excludes sender and human) |
-| `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human") |
+| `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human"; a managed session cannot claim "human") |
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | message body text |
 | `--notify` | bool |  | request a recipient turn (including a managed wake if not running), even with earlier unread mail |
+| `--sign` | bool |  | cryptographically sign this reserved-identity (human/controller) send with the operator-only trust key (see 'gc mail trust init'); refused when this process has a managed-session identity or no trust key is provisioned |
 | `-s`, `--subject` | string |  | message subject line |
 | `--to` | string |  | recipient address (alternative to positional argument) |
 
@@ -2604,6 +2614,63 @@ gc mail thread <id> [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSON result |
+
+## gc mail trust
+
+Manage the Ed25519 keypair that backs "gc mail send --sign".
+
+The private key lets its holder produce a signature that "gc mail check
+--inject", "gc mail inbox", and any other mail reader can independently
+confirm came from a genuine human operator (or an explicitly provisioned
+trusted relay) claiming the reserved "human" or "controller" sender identity
+— without that reader ever needing the private key itself.
+
+Run "gc mail trust init" once, directly in your own terminal, before using
+--sign. Never run it from inside a managed agent session.
+
+```
+gc mail trust
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| [gc mail trust init](#gc-mail-trust-init) | Generate the operator-only signing keypair |
+| [gc mail trust show](#gc-mail-trust-show) | Print the public key and fingerprint |
+
+## gc mail trust init
+
+Generate a new Ed25519 keypair for "gc mail send --sign".
+
+The private key is written with mode 0600 to a machine-local, Gas-City-home
+path (see internal/gchome) that ordinary session commands never read. The
+public key is written alongside it, world-readable by design — sharing it
+does not let anyone forge a signature.
+
+Refuses to run when this process carries a managed-session identity
+(GC_SESSION_ID, GC_ALIAS, or GC_AGENT set): this command must be run by a
+human directly, or by an explicitly provisioned trusted relay process, never
+by a spawned agent session. Refuses to overwrite an existing key unless
+--force is given, since rotating the key invalidates every previously
+verified message's ability to re-verify under the new key.
+
+```
+gc mail trust init [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--force` | bool |  | overwrite an existing key (invalidates previously verified mail) |
+
+## gc mail trust show
+
+Print the currently provisioned public key and its fingerprint.
+
+Safe to run from anywhere, including inside a spawned session: it only
+reveals the public key, which does not let its reader forge a signature.
+
+```
+gc mail trust show
+```
 
 ## gc maintenance
 

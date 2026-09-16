@@ -216,7 +216,9 @@
               "worktree-cleanup",
               "worktree-ensure",
               "worktree-verify",
-              "storage-preflight"
+              "storage-preflight",
+              "mail-trust-init",
+              "mail-trust-show"
             ]
           },
           "event_id": {

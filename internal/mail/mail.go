@@ -9,6 +9,16 @@ import (
 	"time"
 )
 
+// Reserved sender identity names. A message From one of these names claims
+// to speak for the human operator or the orchestrator itself, rather than
+// for an ordinary agent session. See [VerifiedIdentityMetadataKey] and
+// [SignedSender] for the mechanism that lets a claim to one of these names
+// be cryptographically distinguished from an unverified claim.
+const (
+	ReservedIdentityHuman      = "human"
+	ReservedIdentityController = "controller"
+)
+
 // ErrAlreadyArchived is returned by [Provider.Archive] when the message has
 // already been archived or deleted. CLI code uses this to print a distinct
 // message.
@@ -60,6 +70,20 @@ const (
 	// LEGITIMATE session did, not as evidence capable of unmasking a
 	// deliberately spoofed message.
 	CreatedByMetadataKey = "mail.created_by"
+	// VerifiedIdentityMetadataKey stores the reserved identity ("human" or
+	// "controller") a [SignedSender] signature was produced for. It is
+	// compared against the message's own From field at verification time
+	// (see internal/mail/beadmail's beadToMessage): a message whose From
+	// does not match this claim is never treated as verified, regardless of
+	// what the metadata says, closing off a rewrite of From after signing.
+	VerifiedIdentityMetadataKey = "mail.verified_identity"
+	// VerifiedSignatureMetadataKey stores the base64-encoded Ed25519
+	// signature produced by internal/humantrust.Sign over the message's
+	// identity, recipient, body, and issuance time. See [SignedSender].
+	VerifiedSignatureMetadataKey = "mail.verified_signature"
+	// VerifiedIssuedAtMetadataKey stores the RFC3339Nano timestamp the
+	// signature was issued over. See [SignedSender].
+	VerifiedIssuedAtMetadataKey = "mail.verified_issued_at"
 )
 
 // Message represents a mail message between agents or humans.
@@ -76,6 +100,18 @@ type Message struct {
 	Priority  int       `json:"priority,omitempty"`
 	CC        []string  `json:"cc,omitempty"`
 	Rig       string    `json:"rig,omitempty"`
+	// Verified is true when this message's claimed sender identity (From)
+	// was independently confirmed by internal/humantrust.Verify against the
+	// message's own current content — never taken on the caller's word. See
+	// [SignedSender] and internal/mail/beadmail's beadToMessage, the only
+	// place this is currently computed. A provider that does not implement
+	// [SignedSender] never sets this; it defaults to false, identical to
+	// every message's trust status before this mechanism existed.
+	Verified bool `json:"verified,omitempty"`
+	// VerifiedIdentity is the reserved identity (see [ReservedIdentityHuman],
+	// [ReservedIdentityController]) Verified was confirmed for. Empty when
+	// Verified is false.
+	VerifiedIdentity string `json:"verified_identity,omitempty"`
 }
 
 // HandoffIntent is the domain-shaped request for handoff mail. It lets the
@@ -213,4 +249,39 @@ func ReplyWithProvenance(p Provider, id, from, subject, body, createdBy string) 
 		return pr.ReplyWithProvenance(id, from, subject, body, createdBy)
 	}
 	return p.Reply(id, from, subject, body)
+}
+
+// SignedSender is an optional [Provider] extension for backends that can
+// record a cryptographic signature (see internal/humantrust) alongside a
+// reserved-identity ("human" or "controller") send, so the read side can
+// later confirm the claim independently instead of trusting it at face
+// value. from must be [ReservedIdentityHuman] or [ReservedIdentityController]
+// — SendSigned is not a general-purpose provenance channel for ordinary
+// session-to-session mail. signature and issuedAt are exactly the values
+// internal/humantrust.Sign produced; the implementation must store them
+// verbatim (as [VerifiedSignatureMetadataKey]/[VerifiedIssuedAtMetadataKey])
+// rather than re-deriving them, since verification later recomputes the
+// canonical payload from the message's own stored content and compares.
+//
+// Only internal/mail/beadmail implements this today; exec: providers, the
+// fake/fail test doubles, and the HTTP API's mail send path do not — see
+// [SendSigned] and docs/reference/trust-boundaries.md for the explicit scope
+// statement.
+type SignedSender interface {
+	SendSigned(from, to, subject, body string, signature []byte, issuedAt time.Time) (Message, error)
+}
+
+// SendSigned sends through p using [SignedSender] when p implements it,
+// reporting ok=false when it does not so the caller can refuse loudly
+// instead of silently downgrading to an unsigned send that LOOKS the same as
+// a verified one until read back. Never falls back to plain Send: a caller
+// that asked for a signed send and can't get one must be told, not served an
+// unsigned message under the same command.
+func SendSigned(p Provider, from, to, subject, body string, signature []byte, issuedAt time.Time) (msg Message, ok bool, err error) {
+	ss, ok := p.(SignedSender)
+	if !ok {
+		return Message{}, false, nil
+	}
+	msg, err = ss.SendSigned(from, to, subject, body, signature, issuedAt)
+	return msg, true, err
 }

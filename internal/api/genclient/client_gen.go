@@ -2601,18 +2601,20 @@ type MaintenanceTriggerBody struct {
 
 // Message defines model for Message.
 type Message struct {
-	Body      string    `json:"body"`
-	Cc        *[]string `json:"cc,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	From      string    `json:"from"`
-	Id        string    `json:"id"`
-	Priority  *int64    `json:"priority,omitempty"`
-	Read      bool      `json:"read"`
-	ReplyTo   *string   `json:"reply_to,omitempty"`
-	Rig       *string   `json:"rig,omitempty"`
-	Subject   string    `json:"subject"`
-	ThreadId  *string   `json:"thread_id,omitempty"`
-	To        string    `json:"to"`
+	Body             string    `json:"body"`
+	Cc               *[]string `json:"cc,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	From             string    `json:"from"`
+	Id               string    `json:"id"`
+	Priority         *int64    `json:"priority,omitempty"`
+	Read             bool      `json:"read"`
+	ReplyTo          *string   `json:"reply_to,omitempty"`
+	Rig              *string   `json:"rig,omitempty"`
+	Subject          string    `json:"subject"`
+	ThreadId         *string   `json:"thread_id,omitempty"`
+	To               string    `json:"to"`
+	Verified         *bool     `json:"verified,omitempty"`
+	VerifiedIdentity *string   `json:"verified_identity,omitempty"`
 }
 
 // MoleculeResolvedPayload defines model for MoleculeResolvedPayload.
