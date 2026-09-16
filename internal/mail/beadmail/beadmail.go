@@ -29,6 +29,7 @@ const (
 	fromDisplayMetadataKey   = mail.FromDisplayMetadataKey
 	toSessionIDMetadataKey   = mail.ToSessionIDMetadataKey
 	toDisplayMetadataKey     = mail.ToDisplayMetadataKey
+	createdByMetadataKey     = mail.CreatedByMetadataKey
 
 	// messageBeadType is the bead Type every mail message carries. It is the
 	// single confined spelling of the message-bead class marker.
@@ -152,6 +153,16 @@ func (c *sessionInfoCache) isFresh(now time.Time) bool {
 // Returns an error if to is empty: blank recipients produce messages that never
 // appear in any inbox but still inflate global counts.
 func (p *Provider) Send(from, to, subject, body string) (mail.Message, error) {
+	return p.send(from, to, subject, body, "")
+}
+
+// SendWithProvenance is [Provider.Send] plus an independently-sourced
+// createdBy actor. See [mail.ProvenanceRecorder].
+func (p *Provider) SendWithProvenance(from, to, subject, body, createdBy string) (mail.Message, error) {
+	return p.send(from, to, subject, body, createdBy)
+}
+
+func (p *Provider) send(from, to, subject, body, createdBy string) (mail.Message, error) {
 	if to == "" {
 		return mail.Message{}, fmt.Errorf("beadmail send: recipient is required")
 	}
@@ -159,6 +170,7 @@ func (p *Provider) Send(from, to, subject, body string) (mail.Message, error) {
 	if err != nil {
 		return mail.Message{}, fmt.Errorf("beadmail send: %w", err)
 	}
+	metadata = withCreatedBy(metadata, createdBy)
 	threadID := generateThreadID()
 	labels := []string{"thread:" + threadID}
 
@@ -175,6 +187,22 @@ func (p *Provider) Send(from, to, subject, body string) (mail.Message, error) {
 		return mail.Message{}, fmt.Errorf("beadmail send: %w", err)
 	}
 	return beadToMessage(b), nil
+}
+
+// withCreatedBy adds [createdByMetadataKey] to metadata when the caller
+// supplied a non-empty ambient actor, allocating a map only when needed so the
+// common case (no provenance caller, or the older bare Send/Reply) is
+// unaffected.
+func withCreatedBy(metadata map[string]string, createdBy string) map[string]string {
+	createdBy = strings.TrimSpace(createdBy)
+	if createdBy == "" {
+		return metadata
+	}
+	if metadata == nil {
+		metadata = make(map[string]string, 1)
+	}
+	metadata[createdByMetadataKey] = createdBy
+	return metadata
 }
 
 // SendHandoff creates a handoff message from a [mail.HandoffIntent]. It speaks
@@ -602,6 +630,16 @@ func (p *Provider) CheckAutoHandoffs(recipients []string) ([]mail.Message, error
 // original, sets ReplyTo to the original's ID. Reply is addressed to the
 // original sender.
 func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
+	return p.reply(id, from, subject, body, "")
+}
+
+// ReplyWithProvenance is [Provider.Reply] plus an independently-sourced
+// createdBy actor. See [mail.ProvenanceRecorder].
+func (p *Provider) ReplyWithProvenance(id, from, subject, body, createdBy string) (mail.Message, error) {
+	return p.reply(id, from, subject, body, createdBy)
+}
+
+func (p *Provider) reply(id, from, subject, body, createdBy string) (mail.Message, error) {
 	original, err := p.store.Get(id)
 	if err != nil {
 		return mail.Message{}, beadmailError("reply", err)
@@ -625,6 +663,7 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 	if err != nil {
 		return mail.Message{}, fmt.Errorf("beadmail reply: %w", err)
 	}
+	metadata = withCreatedBy(metadata, createdBy)
 	if metadata == nil {
 		metadata = make(map[string]string)
 	}

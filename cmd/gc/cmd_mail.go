@@ -960,6 +960,122 @@ func defaultMailIdentityCandidates() []string {
 	return out
 }
 
+// managedSessionEnvKeys lists the environment variables the orchestrator
+// stamps into a session's process when it spawns it — never set for a human's
+// own interactive shell. See internal/session/lifecycle.go and
+// cmd/gc/build_desired_state.go (Env["GC_AGENT"] = identity, etc.) and
+// bdTelemetryAgentID's use of the same pair for the BEADS_ACTOR-carrying
+// counterpart. Their presence, independent of whether the value they carry
+// resolves to a live session bead, is what distinguishes "this process is a
+// managed session" from "this process is an unmanaged human terminal."
+var managedSessionEnvKeys = []string{"GC_SESSION_ID", "GC_ALIAS", "GC_AGENT"}
+
+// ambientManagedSession reports whether any managed-session identity env var
+// is set to a non-empty value, regardless of what it names.
+func ambientManagedSession() bool {
+	for _, key := range managedSessionEnvKeys {
+		if strings.TrimSpace(os.Getenv(key)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// reservedIdentityEnvClaim reports whether a managed-session identity env var
+// is set to a reserved sender name ("human" or "controller") rather than a
+// real identity, and returns the offending key. The orchestrator only ever
+// assigns these vars a session's own real identity, so a reserved name there
+// can only be a deliberate or accidental override — never a legitimate
+// fallback — and must not be trusted to authenticate the reserved identity it
+// names.
+func reservedIdentityEnvClaim() (key string, claimed bool) {
+	for _, k := range managedSessionEnvKeys {
+		v := strings.TrimSpace(os.Getenv(k))
+		if v == "" {
+			continue
+		}
+		if _, ok := reservedMailSenderIdentity(v); ok {
+			return k, true
+		}
+	}
+	return "", false
+}
+
+// refuseUnauthenticatedHumanSender decides whether a mail sender that resolved
+// to "human" must be refused as an unauthenticated impersonation attempt,
+// closing the gap behind the ga fabricated-authority incident: a session used
+// "gc mail send --from human ..." (and, more subtly, a session whose
+// GC_AGENT/GC_ALIAS was set to the literal string "human") to make its own
+// outgoing mail read as an authenticated escalation from the real human
+// operator, with nothing in the message distinguishing it from the genuine
+// article afterward.
+//
+// Gas City has no channel today that lets a real human operator authenticate a
+// "from human" claim — mail is documented untrusted data
+// (docs/reference/trust-boundaries.md) and no bridge/extmsg inbound path
+// stamps a verified-human marker on mail (extmsg delivers to sessions
+// directly; it never calls into the mail package). The only signal available
+// to tell a genuine unmanaged human terminal apart from a managed agent
+// session is whether the orchestrator stamped this process with a session
+// identity at all, so:
+//
+//   - explicitFrom (an explicit "--from human" on the CLI): refused whenever
+//     ANY managed-session env var is set, to ANY value. A real human never
+//     needs to pass --from at all ("human" is already the default with none of
+//     them set), so there is no legitimate reason for a managed session to
+//     name it explicitly, and doing so is precisely the spoof this closes.
+//   - the implicit default-sender fallback (no --from; GC_SESSION_ID/GC_ALIAS/
+//     GC_AGENT resolution landed on "human"): refused only when one of those
+//     vars is itself set to the reserved name "human" or "controller" — a
+//     value the orchestrator never assigns to a real identity — since that can
+//     only be a deliberate override, not a genuine absence of session context.
+func refuseUnauthenticatedHumanSender(explicitFrom bool) (refuse bool, reason string) {
+	if key, claimed := reservedIdentityEnvClaim(); claimed {
+		return true, fmt.Sprintf("refusing to send as %q: %s is set to a reserved sender identity, which a managed session may never claim", "human", key)
+	}
+	if explicitFrom && ambientManagedSession() {
+		return true, "refusing --from human: this process has a managed session identity (GC_SESSION_ID, GC_ALIAS, or GC_AGENT is set) and may not send mail claiming to be the human operator"
+	}
+	return false, ""
+}
+
+// ambientMailActor returns the identity the runtime environment actually
+// assigned to this process, independent of any --from/sender claim:
+// BEADS_ACTOR (what a bd-backed store attributes writes to; see
+// internal/session/lifecycle.go), then the same GC_SESSION_ID/GC_ALIAS/
+// GC_AGENT chain used for default sender resolution. It is recorded as
+// [mail.CreatedByMetadataKey] on every message the CLI sends or replies to
+// (see mailSendWithProvenance/mailReplyWithProvenance), independent of what
+// the message's From claims — including "human" mail, which previously
+// recorded no provenance at all. Empty means nothing in the environment
+// identifies this process as a managed session.
+func ambientMailActor() string {
+	for _, key := range append([]string{"BEADS_ACTOR"}, managedSessionEnvKeys...) {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// mailSendWithProvenance sends through mp, recording ambientMailActor() as the
+// message's createdBy when mp supports it (see [mail.ProvenanceRecorder]).
+// Providers that don't (exec:, fake, test doubles) fall back to plain Send.
+func mailSendWithProvenance(mp mail.Provider, from, to, subject, body string) (mail.Message, error) {
+	if pr, ok := mp.(mail.ProvenanceRecorder); ok {
+		return pr.SendWithProvenance(from, to, subject, body, ambientMailActor())
+	}
+	return mp.Send(from, to, subject, body)
+}
+
+// mailReplyWithProvenance is [mailSendWithProvenance] for replies.
+func mailReplyWithProvenance(mp mail.Provider, id, from, subject, body string) (mail.Message, error) {
+	if pr, ok := mp.(mail.ProvenanceRecorder); ok {
+		return pr.ReplyWithProvenance(id, from, subject, body, ambientMailActor())
+	}
+	return mp.Reply(id, from, subject, body)
+}
+
 // isStorelessMailProvider reports whether the configured mail provider
 // bypasses the city bead store (exec scripts and test doubles).
 func isStorelessMailProvider() bool {
@@ -1486,7 +1602,11 @@ Creates a message bead addressed to the recipient. The sender defaults
 to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --notify to request
 a recipient turn after sending. In a managed city, it can request a wake for
 a non-running recipient. Unread mail alone does not request a wake.
-Use --from to override the sender identity.
+Use --from to override the sender identity. A managed session (any of
+$GC_SESSION_ID, $GC_ALIAS, $GC_AGENT set) cannot send as "human" — neither via
+--from human nor by having one of those variables itself set to "human" — since
+nothing on this host can authenticate that claim; only a genuinely unmanaged
+shell may default to "human".
 Use --to as an alternative to the positional <to> argument.
 Use -s/--subject for the summary line and -m/--message for the body text.
 Use --all to broadcast to all live sessions (excluding sender and "human").`,
@@ -1515,7 +1635,7 @@ Use --all to broadcast to all live sessions (excluding sender and "human").`,
 	cmd.Flags().BoolVar(&notify, "nudge", false, "alias for --notify")
 	_ = cmd.Flags().MarkHidden("nudge")
 	cmd.Flags().BoolVar(&all, "all", false, "broadcast to all live sessions (excludes sender and human)")
-	cmd.Flags().StringVar(&from, "from", "", "sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or \"human\")")
+	cmd.Flags().StringVar(&from, "from", "", "sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or \"human\"; a managed session cannot claim \"human\")")
 	cmd.Flags().StringVar(&to, "to", "", "recipient address (alternative to positional argument)")
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "message subject line")
 	cmd.Flags().StringVarP(&message, "message", "m", "", "message body text")
@@ -1786,6 +1906,7 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 	}
 
 	sender := from
+	explicitFrom := from != ""
 	if sender == "" {
 		if store != nil {
 			var ok bool
@@ -1800,6 +1921,12 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 		sender, err = resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, sender, idCache)
 		if err != nil {
 			fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", sender, err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+	}
+	if sender == "human" {
+		if refuse, reason := refuseUnauthenticatedHumanSender(explicitFrom); refuse {
+			fmt.Fprintf(stderr, "gc mail send: %s\n", reason) //nolint:errcheck // best-effort stderr
 			return 1
 		}
 	}
@@ -1884,7 +2011,7 @@ func doMailSendJSON(mp mail.Provider, rec events.Recorder, validRecipients map[s
 		return 1
 	}
 
-	m, err := mp.Send(sender, to, subject, body)
+	m, err := mailSendWithProvenance(mp, sender, to, subject, body)
 	telemetry.RecordMailOp(context.Background(), "send", err)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -1955,7 +2082,7 @@ func doMailSendAllJSON(mp mail.Provider, rec events.Recorder, validRecipients ma
 	var sent []mailMessageSummary
 	notified := false
 	for _, to := range recipients {
-		m, err := mp.Send(sender, to, subject, body)
+		m, err := mailSendWithProvenance(mp, sender, to, subject, body)
 		if err != nil {
 			fmt.Fprintf(stderr, "gc mail send --all: sending to %s: %v\n", to, err) //nolint:errcheck // best-effort stderr
 			return 1
@@ -2266,6 +2393,14 @@ func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonO
 			}
 		}
 	}
+	if sender == "human" {
+		// gc mail reply has no --from flag, so this can only be the implicit
+		// default-sender fallback — never an explicit claim.
+		if refuse, reason := refuseUnauthenticatedHumanSender(false); refuse {
+			fmt.Fprintf(stderr, "gc mail reply: %s\n", reason) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+	}
 
 	// Determine body from remaining args if -m not set.
 	body := message
@@ -2289,7 +2424,7 @@ func doMailReply(mp mail.Provider, rec events.Recorder, id, sender, subject, bod
 }
 
 func doMailReplyJSON(mp mail.Provider, rec events.Recorder, id, sender, subject, body string, nudgeFn nudgeFunc, jsonOut bool, stdout, stderr io.Writer) int {
-	reply, err := mp.Reply(id, sender, subject, body)
+	reply, err := mailReplyWithProvenance(mp, id, sender, subject, body)
 	telemetry.RecordMailOp(context.Background(), "reply", err)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc mail reply: %v\n", err) //nolint:errcheck // best-effort stderr

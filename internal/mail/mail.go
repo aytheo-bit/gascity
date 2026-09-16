@@ -40,6 +40,16 @@ const (
 	// ("true"/"false"), set alongside the label by MarkRead/MarkUnread. Retention
 	// sweeps query it directly (the label-based query is recipient-scoped).
 	ReadMetadataKey = "mail.read"
+	// CreatedByMetadataKey stores the ambient actor a [ProvenanceRecorder]
+	// caller independently observed running the command (BEADS_ACTOR,
+	// GC_SESSION_ID, GC_ALIAS, or GC_AGENT — see cmd/gc's ambientMailActor),
+	// regardless of what the message's From field claims. From is a caller
+	// assertion; this is provenance the caller could not fabricate through the
+	// From argument alone, and it is populated even when From is "human" — the
+	// case that previously left every human-attributed message with no trail
+	// back to the process that actually created it (ga fabricated-authority
+	// incident).
+	CreatedByMetadataKey = "mail.created_by"
 )
 
 // Message represents a mail message between agents or humans.
@@ -150,4 +160,18 @@ type Provider interface {
 // unread inbox messages for multiple recipients in one backend pass.
 type MultiRecipientInboxer interface {
 	InboxRecipients(recipients []string) ([]Message, error)
+}
+
+// ProvenanceRecorder is an optional [Provider] extension for backends that can
+// record an independently-sourced createdBy actor alongside the caller-claimed
+// display sender. from is what the message SAYS ("human", an alias, a session
+// address) and is caller-supplied, so it can lie; createdBy is what the caller
+// separately observed the runtime environment attribute to this process, and
+// is recorded on the message as [CreatedByMetadataKey] regardless of what from
+// claims to be. A provider that does not implement this (exec:, fake, test
+// doubles) keeps prior Send/Reply behavior — callers should type-assert and
+// fall back to plain Send/Reply when the concrete provider does not support it.
+type ProvenanceRecorder interface {
+	SendWithProvenance(from, to, subject, body, createdBy string) (Message, error)
+	ReplyWithProvenance(id, from, subject, body, createdBy string) (Message, error)
 }

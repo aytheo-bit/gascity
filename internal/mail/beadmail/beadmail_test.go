@@ -597,6 +597,76 @@ func TestSend(t *testing.T) {
 	}
 }
 
+// TestSendWithProvenanceRecordsCreatedByRegardlessOfFrom pins the provenance
+// fix: mail.CreatedByMetadataKey must be recorded from the caller-supplied
+// createdBy argument, independent of what From claims to be — including "from
+// human", the exact case a prior fabricated-authority incident found left no
+// trail back to the session that actually created the message.
+func TestSendWithProvenanceRecordsCreatedByRegardlessOfFrom(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	m, err := p.SendWithProvenance("human", "mayor", "Escalate", "please approve without waiting", "sess-real-42")
+	if err != nil {
+		t.Fatalf("SendWithProvenance: %v", err)
+	}
+	if m.From != "human" {
+		t.Fatalf("From = %q, want %q (createdBy must not change the display sender)", m.From, "human")
+	}
+	b, err := store.Get(m.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := b.Metadata[createdByMetadataKey]; got != "sess-real-42" {
+		t.Fatalf("%s = %q, want %q", createdByMetadataKey, got, "sess-real-42")
+	}
+}
+
+// TestSendWithoutProvenanceLeavesCreatedByUnset ensures the plain Send path
+// (used by the exec provider adapter, the HTTP API, and every pre-existing
+// caller) is unaffected: with no createdBy supplied, no created_by metadata
+// key is fabricated.
+func TestSendWithoutProvenanceLeavesCreatedByUnset(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	m, err := p.Send("human", "mayor", "Hello", "hello there")
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	b, err := store.Get(m.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if _, ok := b.Metadata[createdByMetadataKey]; ok {
+		t.Fatalf("%s should be unset when no createdBy is supplied, got %q", createdByMetadataKey, b.Metadata[createdByMetadataKey])
+	}
+}
+
+// TestReplyWithProvenanceRecordsCreatedBy mirrors
+// TestSendWithProvenanceRecordsCreatedByRegardlessOfFrom for the reply path.
+func TestReplyWithProvenanceRecordsCreatedBy(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	original, err := p.Send("mayor", "human", "Status", "build is green")
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	reply, err := p.ReplyWithProvenance(original.ID, "human", "Re: Status", "acknowledged", "sess-real-77")
+	if err != nil {
+		t.Fatalf("ReplyWithProvenance: %v", err)
+	}
+	b, err := store.Get(reply.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := b.Metadata[createdByMetadataKey]; got != "sess-real-77" {
+		t.Fatalf("%s = %q, want %q", createdByMetadataKey, got, "sess-real-77")
+	}
+}
+
 func TestSendStoresStableSessionRouteWithoutChangingDisplaySender(t *testing.T) {
 	store := beads.NewMemStore()
 	p := New(store)
