@@ -48,6 +48,36 @@ rig, provider, or workflow configuration. Explicit values are preserved because
 they represent an operator decision, and failure logs redact known secret values
 before writing order exec errors or events.
 
+## Mail Sender Identity
+
+Mail `From` (and the `mail.created_by` provenance metadata alongside it) is a
+caller-supplied claim, not a verified identity — this is true for `gc mail
+send`/`gc mail reply`/`gc handoff` and for the HTTP `POST /v0/mail` and
+`POST /v0/mail/{id}/reply` endpoints alike.
+
+- The CLI refuses a sender claim that resolves to the reserved "human" identity
+  when a managed-session identity env var (`GC_SESSION_ID`, `GC_ALIAS`,
+  `GC_AGENT`) is present (see `refuseUnauthenticatedHumanSender` in
+  `cmd/gc/cmd_mail.go`). This is defense-in-depth against careless or naive
+  misuse, not authentication: those env vars are ordinary process environment
+  (see "Ambient process environment" above) that the calling process fully
+  controls, so a session that deliberately clears them before invoking `gc`
+  is indistinguishable from a genuinely unmanaged human shell and is not
+  caught. Closing that would need a signal the session's own process cannot
+  erase (e.g. an orchestrator-owned identity registry independent of the
+  child's env, or a kernel-verified channel); no such signal exists in gascity
+  today.
+- The HTTP API has no equivalent guard at all: `POST /v0/mail` accepts a
+  caller-supplied `from` (including "human") from any process able to reach
+  127.0.0.1:9443, with no per-caller authentication. Closing this needs a
+  caller-authentication design (e.g. per-session tokens) and is tracked as a
+  follow-up, not fixed by the CLI-side gate above.
+
+Do not describe either mechanism as verifying who sent a message. Treat all
+mail `From` and `mail.created_by` values as claims from the same trust domain
+as the caller, useful for reconstructing what a legitimate caller did, not as
+evidence capable of unmasking a deliberately spoofed message.
+
 ## Rules For Authors
 
 - Do not put secrets directly in command strings. Use env variables or provider

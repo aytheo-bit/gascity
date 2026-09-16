@@ -1029,6 +1029,41 @@ func reservedIdentityEnvClaim() (key string, claimed bool) {
 //     vars is itself set to the reserved name "human" or "controller" — a
 //     value the orchestrator never assigns to a real identity — since that can
 //     only be a deliberate override, not a genuine absence of session context.
+//
+// LIMITATION (deliberately not oversold as a hardened fix): every signal this
+// function checks is an ordinary environment variable the calling process
+// fully controls. A session that runs, e.g.,
+//
+//	env -u GC_SESSION_ID -u GC_ALIAS -u GC_AGENT gc mail send --from human ...
+//
+// before invoking gc removes every signal this function can see and becomes,
+// from gc's point of view, indistinguishable from a genuinely unmanaged human
+// shell — the implicit fallback then legitimately defaults to "human" and
+// this function does not (and, absent a new signal, cannot) refuse it. This
+// was confirmed empirically (a throwaway test proved the bypass, then was
+// deleted) rather than assumed.
+//
+// Closing that would require a signal the session's own process cannot erase
+// — e.g. an orchestrator-owned registry of managed-session identities keyed
+// by PID/PPID ancestry or a kernel-verified channel (a Unix-socket peer
+// credential, a namespace/cgroup boundary) — none of which exists in gascity
+// today. The closest analogues (tmux's per-pane `set-environment` table,
+// beadmail's instance-token fencing in cmd_hook.go's classifyHookClaimSession)
+// all still gate on env-supplied identifiers being present in the first
+// place, so they offer no independent proof once GC_SESSION_ID/GC_ALIAS/
+// GC_AGENT are stripped, and a PID/PPID walk is itself defeatable by
+// setsid/re-parenting (see internal/workspacesvc/orphan_reap.go, which treats
+// that re-parenting as a normal, expected event, not an anomaly). Building a
+// forge-proof check is real infrastructure work beyond this fix's scope.
+//
+// This function is therefore defense-in-depth against careless or naive
+// misuse — a session that types --from human without thinking, or whose
+// GC_AGENT happens to be set to the literal "human" — not a boundary that
+// withstands a determined adversary who knows to strip their own
+// environment. Treat [CreatedByMetadataKey] the same way: it is a same-
+// trust-domain breadcrumb, not independent verification. See
+// TestCmdMailSendKnownLimitationEnvStripBypassesHumanGate for the pinned,
+// intentionally-unclosed regression case.
 func refuseUnauthenticatedHumanSender(explicitFrom bool) (refuse bool, reason string) {
 	if key, claimed := reservedIdentityEnvClaim(); claimed {
 		return true, fmt.Sprintf("refusing to send as %q: %s is set to a reserved sender identity, which a managed session may never claim", "human", key)
@@ -1059,21 +1094,16 @@ func ambientMailActor() string {
 }
 
 // mailSendWithProvenance sends through mp, recording ambientMailActor() as the
-// message's createdBy when mp supports it (see [mail.ProvenanceRecorder]).
-// Providers that don't (exec:, fake, test doubles) fall back to plain Send.
+// message's createdBy via [mail.SendWithProvenance]. Providers that don't
+// implement [mail.ProvenanceRecorder] (exec:, fake, test doubles) fall back to
+// plain Send.
 func mailSendWithProvenance(mp mail.Provider, from, to, subject, body string) (mail.Message, error) {
-	if pr, ok := mp.(mail.ProvenanceRecorder); ok {
-		return pr.SendWithProvenance(from, to, subject, body, ambientMailActor())
-	}
-	return mp.Send(from, to, subject, body)
+	return mail.SendWithProvenance(mp, from, to, subject, body, ambientMailActor())
 }
 
 // mailReplyWithProvenance is [mailSendWithProvenance] for replies.
 func mailReplyWithProvenance(mp mail.Provider, id, from, subject, body string) (mail.Message, error) {
-	if pr, ok := mp.(mail.ProvenanceRecorder); ok {
-		return pr.ReplyWithProvenance(id, from, subject, body, ambientMailActor())
-	}
-	return mp.Reply(id, from, subject, body)
+	return mail.ReplyWithProvenance(mp, id, from, subject, body, ambientMailActor())
 }
 
 // isStorelessMailProvider reports whether the configured mail provider
@@ -1460,6 +1490,16 @@ func resolveDefaultMailTargetsForCommand(stderr io.Writer, cmdName string) (reso
 	return resolvedMailTarget{}, false
 }
 
+// resolveDefaultMailSenderForCommand is the single shared resolver for the
+// implicit ($GC_SESSION_ID/$GC_ALIAS/$GC_AGENT-or-"human") default sender used
+// by every CLI command that does not take its own explicit --from: gc mail
+// reply and gc handoff --target both call this directly, and gc mail send
+// calls it whenever --from was not given. The unauthenticated-human refusal
+// is gated HERE rather than at each call site so a future caller that resolves
+// a default sender through this function is covered automatically instead of
+// depending on remembering to add the check again (gc handoff's SendHandoff
+// path originally shipped without it — see refuseUnauthenticatedHumanSender's
+// doc comment for what this can and cannot catch).
 func resolveDefaultMailSenderForCommand(cityPath string, cfg *config.City, sessStore beads.Store, stderr io.Writer, cmdName string) (string, bool) {
 	return resolveDefaultMailSenderForCommandCached(cityPath, cfg, sessStore, stderr, cmdName, nil)
 }
@@ -1469,6 +1509,16 @@ func resolveDefaultMailSenderForCommandCached(cityPath string, cfg *config.City,
 	for _, c := range candidates {
 		sender, err := resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, c, cache)
 		if err == nil {
+			// This resolver only ever runs the implicit (no --from) path, so
+			// explicitFrom is always false here; an explicit "--from human" on
+			// gc mail send is refused separately, at that call site, because
+			// this function is never reached for it.
+			if sender == "human" {
+				if refuse, reason := refuseUnauthenticatedHumanSender(false); refuse {
+					fmt.Fprintf(stderr, "%s: %s\n", cmdName, reason) //nolint:errcheck // best-effort stderr
+					return "", false
+				}
+			}
 			return sender, true
 		}
 		if !errors.Is(err, session.ErrSessionNotFound) {
@@ -1603,10 +1653,14 @@ to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --notify to request
 a recipient turn after sending. In a managed city, it can request a wake for
 a non-running recipient. Unread mail alone does not request a wake.
 Use --from to override the sender identity. A managed session (any of
-$GC_SESSION_ID, $GC_ALIAS, $GC_AGENT set) cannot send as "human" — neither via
---from human nor by having one of those variables itself set to "human" — since
-nothing on this host can authenticate that claim; only a genuinely unmanaged
-shell may default to "human".
+$GC_SESSION_ID, $GC_ALIAS, $GC_AGENT set) is refused if it tries to send as
+"human" — neither via --from human nor by having one of those variables
+itself set to "human" — since nothing on this host can independently verify
+that claim; only a genuinely unmanaged shell may default to "human". This is
+a defense-in-depth guard against careless or naive misuse, not a hardened
+authentication boundary: a session that deliberately clears its own
+GC_SESSION_ID/GC_ALIAS/GC_AGENT before invoking gc is indistinguishable from
+an unmanaged shell and is not caught.
 Use --to as an alternative to the positional <to> argument.
 Use -s/--subject for the summary line and -m/--message for the body text.
 Use --all to broadcast to all live sessions (excluding sender and "human").`,

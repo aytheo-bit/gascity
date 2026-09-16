@@ -373,9 +373,34 @@ func (s *Server) humaHandleMailGet(ctx context.Context, input *MailGetInput) (*I
 	}, nil
 }
 
+// unauthenticatedAPIMailActor is the [mail.CreatedByMetadataKey] value
+// recorded for mail sent/replied through the HTTP API. POST /v0/mail and
+// POST /v0/mail/{id}/reply accept a caller-supplied `from` with no per-caller
+// authentication at all (see this handler's doc comment and
+// docs/reference/trust-boundaries.md) — there is no ambient-process signal
+// analogous to cmd/gc's ambientMailActor() to observe here, because the
+// caller is a network client, not a child process this server spawned. This
+// constant makes that absence explicit in mail.created_by instead of leaving
+// it silently blank (which would look like "not recorded") or, worse,
+// populating it with something that could be mistaken for a verified
+// identity.
+const unauthenticatedAPIMailActor = "http-api:unauthenticated"
+
 // humaHandleMailSend is the Huma-typed handler for POST /v0/mail.
 // Body validation (To and Subject required, minLength:"1") is enforced by
 // the framework from MailSendInput's struct tags.
+//
+// Known gap, stated plainly rather than downplayed: this endpoint takes a
+// caller-supplied `from` (including "human") with zero authentication, bound
+// to 127.0.0.1:9443 and reachable by any process on the host — the same
+// fabricated-authority spoof the CLI's refuseUnauthenticatedHumanSender
+// closes for `gc mail send`/`gc mail reply`/`gc handoff` has no equivalent
+// guard here, because there is no ambient-process signal to check for an
+// arbitrary network caller. Closing it needs a real caller-authentication
+// design (e.g. per-session tokens) and is intentionally out of scope for this
+// change; this change only makes the gap visible in the recorded provenance
+// (see unauthenticatedAPIMailActor) instead of silently leaving created_by
+// unset here while the CLI path populates it.
 func (s *Server) humaHandleMailSend(ctx context.Context, input *MailSendInput) (*IndexOutput[mail.Message], error) {
 	resolved, resolveErr := s.resolveMailSendRecipientWithContext(ctx, input.Body.To)
 	if resolveErr != nil {
@@ -395,7 +420,7 @@ func (s *Server) humaHandleMailSend(ctx context.Context, input *MailSendInput) (
 	// fires. The helper guarantees the reservation is released on a send error.
 	msg, err := withIdempotency(s.idem, "/v0/mail", input.IdempotencyKey, input.Body,
 		func() (mail.Message, error) {
-			sent, sendErr := mp.Send(input.Body.From, resolved, input.Body.Subject, input.Body.Body)
+			sent, sendErr := mail.SendWithProvenance(mp, input.Body.From, resolved, input.Body.Subject, input.Body.Body, unauthenticatedAPIMailActor)
 			telemetry.RecordMailOp(ctx, "send", sendErr)
 			if sendErr != nil {
 				return mail.Message{}, apierr.Internal.Msg(sendErr.Error())
@@ -639,6 +664,10 @@ func (s *Server) humaHandleMailArchive(ctx context.Context, input *MailArchiveIn
 }
 
 // humaHandleMailReply is the Huma-typed handler for POST /v0/mail/{id}/reply.
+// See humaHandleMailSend's doc comment: this endpoint has the identical
+// unauthenticated caller-supplied `from` gap, and the identical stopgap of
+// recording unauthenticatedAPIMailActor rather than leaving created_by
+// silently unset.
 func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput) (*IndexOutput[mail.Message], error) {
 	id := input.ID
 	rig := input.Rig
@@ -660,7 +689,7 @@ func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput)
 				return mail.Message{}, apierr.MailNotFound.Msg("message " + id + " not found")
 			}
 
-			sent, replyErr := mp.Reply(id, input.Body.From, input.Body.Subject, input.Body.Body)
+			sent, replyErr := mail.ReplyWithProvenance(mp, id, input.Body.From, input.Body.Subject, input.Body.Body, unauthenticatedAPIMailActor)
 			telemetry.RecordMailOp(ctx, "reply", replyErr)
 			if replyErr != nil {
 				return mail.Message{}, apierr.Internal.Msg(replyErr.Error())

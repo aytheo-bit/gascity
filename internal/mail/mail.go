@@ -41,14 +41,24 @@ const (
 	// sweeps query it directly (the label-based query is recipient-scoped).
 	ReadMetadataKey = "mail.read"
 	// CreatedByMetadataKey stores the ambient actor a [ProvenanceRecorder]
-	// caller independently observed running the command (BEADS_ACTOR,
+	// caller read from its own process environment (BEADS_ACTOR,
 	// GC_SESSION_ID, GC_ALIAS, or GC_AGENT — see cmd/gc's ambientMailActor),
-	// regardless of what the message's From field claims. From is a caller
-	// assertion; this is provenance the caller could not fabricate through the
-	// From argument alone, and it is populated even when From is "human" — the
-	// case that previously left every human-attributed message with no trail
-	// back to the process that actually created it (ga fabricated-authority
-	// incident).
+	// separately from whatever the message's From field claims. It is
+	// populated even when From is "human" — the case that previously left
+	// every human-attributed message with no trail back to the process that
+	// actually created it (ga fabricated-authority incident).
+	//
+	// This is NOT independent verification of the sender, and must not be
+	// described or relied on as such: createdBy is sourced from the exact
+	// same trust domain as From — ordinary environment variables the calling
+	// process fully controls (BEADS_ACTOR in particular can be set to
+	// anything). A caller that lies about From by first rewriting or
+	// stripping its own environment makes createdBy lie the same way; the two
+	// are only independent of EACH OTHER (a caller can't change one via the
+	// other's argument), not independent of the caller. Treat this field as a
+	// same-trust-domain audit breadcrumb useful for reconstructing what a
+	// LEGITIMATE session did, not as evidence capable of unmasking a
+	// deliberately spoofed message.
 	CreatedByMetadataKey = "mail.created_by"
 )
 
@@ -163,15 +173,44 @@ type MultiRecipientInboxer interface {
 }
 
 // ProvenanceRecorder is an optional [Provider] extension for backends that can
-// record an independently-sourced createdBy actor alongside the caller-claimed
+// record a caller-observed createdBy actor alongside the caller-claimed
 // display sender. from is what the message SAYS ("human", an alias, a session
-// address) and is caller-supplied, so it can lie; createdBy is what the caller
-// separately observed the runtime environment attribute to this process, and
-// is recorded on the message as [CreatedByMetadataKey] regardless of what from
-// claims to be. A provider that does not implement this (exec:, fake, test
-// doubles) keeps prior Send/Reply behavior — callers should type-assert and
-// fall back to plain Send/Reply when the concrete provider does not support it.
+// address); createdBy is a value the caller read from its own environment,
+// recorded on the message as [CreatedByMetadataKey] regardless of what from
+// claims to be. See [CreatedByMetadataKey]'s doc comment: createdBy is
+// observed separately from from, but both come from the same caller-
+// controlled trust domain, so this is an audit trail for legitimate callers,
+// not an authentication mechanism — it cannot be relied on to catch a caller
+// that deliberately lies about both. A provider that does not implement this
+// (exec:, fake, test doubles) keeps prior Send/Reply behavior — callers should
+// type-assert and fall back to plain Send/Reply when the concrete provider
+// does not support it (or use [SendWithProvenance]/[ReplyWithProvenance],
+// which do this for you).
 type ProvenanceRecorder interface {
 	SendWithProvenance(from, to, subject, body, createdBy string) (Message, error)
 	ReplyWithProvenance(id, from, subject, body, createdBy string) (Message, error)
+}
+
+// SendWithProvenance sends through p, recording createdBy via
+// [ProvenanceRecorder] when p implements it, and falling back to plain
+// [Provider.Send] otherwise (exec:, fake, and other providers that don't
+// implement the optional interface). createdBy should be the caller's best
+// honest label for who/what actually invoked this send — including an
+// explicit "no real signal available" placeholder such as an unauthenticated-
+// surface marker — rather than silently omitted, so a reader of
+// [CreatedByMetadataKey] can tell "we don't know" from "we forgot to record
+// it".
+func SendWithProvenance(p Provider, from, to, subject, body, createdBy string) (Message, error) {
+	if pr, ok := p.(ProvenanceRecorder); ok {
+		return pr.SendWithProvenance(from, to, subject, body, createdBy)
+	}
+	return p.Send(from, to, subject, body)
+}
+
+// ReplyWithProvenance is [SendWithProvenance] for replies.
+func ReplyWithProvenance(p Provider, id, from, subject, body, createdBy string) (Message, error) {
+	if pr, ok := p.(ProvenanceRecorder); ok {
+		return pr.ReplyWithProvenance(id, from, subject, body, createdBy)
+	}
+	return p.Reply(id, from, subject, body)
 }

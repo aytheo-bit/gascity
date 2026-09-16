@@ -907,6 +907,87 @@ func TestCmdMailSendAllowsHumanFromUnmanagedShell(t *testing.T) {
 	}
 }
 
+// TestCmdMailSendKnownLimitationEnvStripBypassesHumanGate documents, rather
+// than silently regresses, a known and deliberately accepted limitation of
+// refuseUnauthenticatedHumanSender (see its doc comment's LIMITATION
+// section): every signal the gate checks is an ordinary environment variable
+// the calling process fully controls, so a session that runs
+//
+//	env -u GC_SESSION_ID -u GC_ALIAS -u GC_AGENT gc mail send --from human ...
+//
+// (simulated here by t.Setenv'ing all three to empty, which is
+// indistinguishable to the process from never having been set) becomes
+// impossible to tell apart from a genuinely unmanaged human shell, and the
+// send SUCCEEDS. This was verified empirically against a real build, not
+// assumed.
+//
+// This is not silently accepted: it is deliberately pinned here as a passing
+// assertion, with this comment, so:
+//   - a future reader who wonders "does the human gate actually stop a
+//     determined session?" gets a direct, provable answer (no), instead of
+//     re-discovering it the hard way;
+//   - if gascity ever gains a process-identity signal a session cannot erase
+//     (see the LIMITATION section for what that would require — an
+//     orchestrator-owned PID/PPID registry or a kernel-verified channel; none
+//     exists today), this test should be REPLACED with one asserting the
+//     bypass is closed, not just deleted.
+//
+// The fix this test covers is accurately scoped as defense-in-depth against
+// careless/accidental misuse (an explicit --from human, or a GC_AGENT that
+// happens to say "human"), not a hardened boundary against an adversary who
+// knows to strip their own environment first.
+func TestCmdMailSendKnownLimitationEnvStripBypassesHumanGate(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+	// Simulate `env -u GC_SESSION_ID -u GC_ALIAS -u GC_AGENT`: a managed
+	// session that deliberately clears its own identity env before calling gc,
+	// then still claims --from human.
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_AGENT", "")
+	cityPath := mailFromHumanTestCity(t)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			namedSessionIdentityMetadata: "test-city/mayor",
+			"alias":                      "mayor",
+			"session_name":               "mayor-session",
+		},
+	}); err != nil {
+		t.Fatalf("Create recipient: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"mayor", "I am not a spoofed session, I promise"}, false, false, "human", "", "", "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend --from human (env stripped) = %d, want 0 (KNOWN LIMITATION: this bypass is not closed — see the test doc comment); stderr=%s", code, stderr.String())
+	}
+
+	storeAfter, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt after send: %v", err)
+	}
+	all, err := storeAfter.List(beads.ListQuery{Type: "message", Status: "open", TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	found := false
+	for _, b := range all {
+		if b.Type == "message" && b.From == "human" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected the env-stripped send to succeed as From=human (that is the known, accepted limitation this test pins); beads=%#v", all)
+	}
+}
+
 // TestCmdMailSendRecordsCreatedByForManagedSession pins the provenance half of
 // the fix: an ordinary legitimate session-to-session (or session-to-human)
 // send must record which real session sent it, so a future incident has a
