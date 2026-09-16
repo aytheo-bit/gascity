@@ -2121,8 +2121,15 @@ func TestSendMailNotifyWithProviderStartsCodexPollerWhenQueueingRunningSession(t
 	}
 	t.Cleanup(func() { startNudgePoller = prev })
 
-	if err := sendMailNotifyWithProvider(target, fake); err != nil {
-		t.Fatalf("sendMailNotifyWithProvider: %v", err)
+	// The session is genuinely running (not idle/stopped, not a fence
+	// mismatch) but codex has no live wait-idle delivery path at all
+	// (nudgeWaitIdle only attempts it for the "claude" provider family), so
+	// this always downgrades to the queue. That downgrade must be reported,
+	// not silently swallowed as if the notify had been delivered live -- see
+	// ErrMailNotifyLiveDeliveryUnconfirmed.
+	err := sendMailNotifyWithProvider(target, fake)
+	if !errors.Is(err, ErrMailNotifyLiveDeliveryUnconfirmed) {
+		t.Fatalf("sendMailNotifyWithProvider: err = %v, want wrapping ErrMailNotifyLiveDeliveryUnconfirmed", err)
 	}
 	if !called {
 		t.Fatal("startNudgePoller was not called")
@@ -2155,8 +2162,13 @@ func TestSendMailNotifyWithProviderStartsClaudePollerWhenQueueingRunningSession(
 	}
 	t.Cleanup(func() { startNudgePoller = prev })
 
-	if err := sendMailNotifyWithProvider(target, fake); err != nil {
-		t.Fatalf("sendMailNotifyWithProvider: %v", err)
+	// The session never reaches an idle boundary within the wait-idle budget
+	// (ErrInteractionUnsupported here stands in for "WaitForIdle never
+	// confirms idle"), so live delivery downgrades to the queue. That must be
+	// reported rather than silently treated as delivered.
+	err := sendMailNotifyWithProvider(target, fake)
+	if !errors.Is(err, ErrMailNotifyLiveDeliveryUnconfirmed) {
+		t.Fatalf("sendMailNotifyWithProvider: err = %v, want wrapping ErrMailNotifyLiveDeliveryUnconfirmed", err)
 	}
 	if !called {
 		t.Fatal("startNudgePoller was not called")
@@ -2199,8 +2211,12 @@ func TestSendMailNotifyWithWorkerStartsPollerBySessionIDForAliasedTarget(t *test
 	}
 	t.Cleanup(func() { startNudgePoller = prev })
 
-	if err := sendMailNotifyWithWorker(target, store, fake, "human", ""); err != nil {
-		t.Fatalf("sendMailNotifyWithWorker: %v", err)
+	// This is the ops32-p0-codex shape: a genuinely running, codex-templated
+	// session with no live wait-idle delivery path. The notify must report
+	// that it only queued the reminder, not that it delivered it live.
+	err = sendMailNotifyWithWorker(target, store, fake, "human", "")
+	if !errors.Is(err, ErrMailNotifyLiveDeliveryUnconfirmed) {
+		t.Fatalf("sendMailNotifyWithWorker: err = %v, want wrapping ErrMailNotifyLiveDeliveryUnconfirmed", err)
 	}
 	if !called {
 		t.Fatal("startNudgePoller was not called")
@@ -2367,6 +2383,71 @@ func TestSendMailNotifyWithWorkerAcksDeliveredUnobservedInsteadOfDuplicating(t *
 		t.Fatalf("pending=%d inFlight=%d dead=%d, want 0/0/0: a drained-but-unobserved submit is proven delivery and must not be re-queued as a duplicate mail notification", len(pending), len(inFlight), len(dead))
 	}
 	assertSessionLastNudgeDeliveredAtStamped(t, store, info.ID)
+}
+
+// TestSendMailNotifyWithWorkerReportsUnconfirmedSubmitInsteadOfSilentSuccess
+// reproduces the 2026-09-16 silent-mail-failure report directly at the
+// notify layer: a target session that is genuinely RUNNING (WaitForIdle
+// succeeds -- this is not the suspected respawn/fence-mismatch explanation,
+// which is a distinct, already-loud failure mode for `gc session nudge`),
+// whose final submit keystrokes are accepted by tmux but never confirmed
+// (tmux.ErrNudgeSubmitUnconfirmed -- the exact evidence a live tmux
+// capture-pane before/after would show as byte-identical content). Before
+// this fix, sendMailNotifyWithWorker swallowed that error entirely and
+// returned nil, so `gc mail send` printed "Sent message ... to ..." and
+// reported notified=true even though nothing was ever typed into the
+// recipient's pane. It must now report the failure (wrapping
+// ErrMailNotifyLiveDeliveryUnconfirmed) while still queuing the reminder so
+// the message is not altogether lost.
+func TestSendMailNotifyWithWorkerReportsUnconfirmedSubmitInsteadOfSilentSuccess(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	fake := runtime.NewFake()
+	mgr := newSessionManagerWithConfig(dir, store, fake, nil)
+
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "worker", Title: "Worker", Command: "claude", WorkDir: dir, Provider: "claude", Env: nil, Resume: session.ProviderResume{}, Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// The session is genuinely idle (not stuck respawning, not fence
+	// mismatched) -- WaitForIdle succeeds -- but the submit itself is
+	// accepted-but-unconfirmed, matching the tmux-layer failure mode ga-bwm
+	// and #6355 defend against on the session-nudge path.
+	fake.WaitForIdleErrors[info.SessionName] = nil
+	fake.NudgeErrors = map[string]error{info.SessionName: tmux.ErrNudgeSubmitUnconfirmed}
+
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker"},
+		sessionID:   info.ID,
+		resolved:    &config.ResolvedProvider{Name: "claude"},
+		sessionName: info.SessionName,
+	}
+
+	err = sendMailNotifyWithWorker(target, store, fake, "human", "gc-mail-99")
+	if !errors.Is(err, ErrMailNotifyLiveDeliveryUnconfirmed) {
+		t.Fatalf("sendMailNotifyWithWorker: err = %v, want wrapping ErrMailNotifyLiveDeliveryUnconfirmed", err)
+	}
+	if !errors.Is(err, tmux.ErrNudgeSubmitUnconfirmed) {
+		t.Fatalf("sendMailNotifyWithWorker: err = %v, want it to also wrap the underlying tmux.ErrNudgeSubmitUnconfirmed for diagnosis", err)
+	}
+
+	// The reminder must still be queued -- reporting the failure loudly must
+	// not come at the cost of losing the notification outright.
+	pending, inFlight, dead, err := listQueuedNudgesForTarget(dir, target, time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudgesForTarget: %v", err)
+	}
+	if len(pending) != 1 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead = %d/%d/%d, want 1/0/0: an unconfirmed live submit must still be queued for retry, not dropped", len(pending), len(inFlight), len(dead))
+	}
 }
 
 func TestSendMailNotifyWithWorkerQueuesWhenRuntimeIsGone(t *testing.T) {

@@ -1327,6 +1327,26 @@ func sendMailNotifyWithProvider(target nudgeTarget, sp runtime.Provider) error {
 	return sendMailNotifyWithWorker(target, nil, sp, "human", "")
 }
 
+// ErrMailNotifyLiveDeliveryUnconfirmed reports that gc observed the mail
+// recipient's session as RUNNING, genuinely attempted live delivery of the
+// mail nudge to its pane, and that attempt did not land (or could not be
+// confirmed) -- as distinct from the session simply being idle/stopped,
+// which is the ordinary, silent-by-design queue path below. The mail
+// message itself is still queued for later delivery when this fires (the
+// enqueue happens unconditionally, before this error is returned); the
+// point of this sentinel is only to stop that downgrade from being
+// invisible. Before this, any failure here (a handle.Nudge error such as
+// tmux.ErrNudgeSubmitUnconfirmed, or a handle-acquisition failure such as a
+// session-generation/fence mismatch) was swallowed and the function
+// returned nil exactly like a confirmed live delivery, so `gc mail send`
+// printed "Sent message ... to ..." and reported notified=true even though
+// nothing was ever typed into the recipient's pane -- the silent-failure
+// gap a live tmux capture proved on 2026-09-16 (byte-identical pane content
+// before and after). doMailSendJSON's existing `nudge failed: %v` stderr
+// line already existed for exactly this signal; it just never fired
+// because this function never returned an error for it to catch.
+var ErrMailNotifyLiveDeliveryUnconfirmed = errors.New("mail notify: live delivery to running session was not confirmed; queued for later delivery")
+
 func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.Provider, sender, messageID string) error {
 	msg := fmt.Sprintf("You have mail from %s", sender)
 	now := time.Now()
@@ -1350,9 +1370,26 @@ func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.
 	if err != nil {
 		return err
 	}
+	// liveErr, once set, records a genuine (non-structural) live-delivery
+	// failure against a target obs reports as Running, so it is surfaced via
+	// ErrMailNotifyLiveDeliveryUnconfirmed below instead of being discarded.
+	// It is deliberately NOT set for the two structural, expected downgrades
+	// that deliverSessionNudgeWithWorker (the `gc session nudge` path) also
+	// treats as silent: nudgeErr == nil with result.Undelivered
+	// (ProviderUnsupported / NoIdleBoundary), and an ACP handle whose Nudge
+	// call misses because this process does not own the ACP connection
+	// (errors.Is(nudgeErr, runtime.ErrSessionNotFound) on an acp transport)
+	// -- see the identical carve-out in deliverSessionNudgeWithWorker.
+	var liveErr error
 	if obs.Running {
-		handle, err := workerHandleForNudgeTarget(target, sessStore, sp)
-		if err == nil {
+		handle, handleErr := workerHandleForNudgeTarget(target, sessStore, sp)
+		if handleErr != nil {
+			// Unlike the ACP-Nudge-miss carve-out below, a handle-acquisition
+			// failure (e.g. a session-generation/fence mismatch) has no
+			// structural exemption in deliverSessionNudgeWithWorker either --
+			// it is always loud there, so it is always loud here too.
+			liveErr = handleErr
+		} else {
 			result, nudgeErr := handle.Nudge(context.Background(), worker.NudgeRequest{
 				Text:     msg,
 				Delivery: worker.NudgeDeliveryWaitIdle,
@@ -1374,6 +1411,29 @@ func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.
 				stampLastNudgeDeliveredAt(sessFront, target.sessionID, time.Now())
 				return nil
 			}
+			acpNotOwned := errors.Is(nudgeErr, runtime.ErrSessionNotFound) && target.sessionTransport() == "acp"
+			switch {
+			case nudgeErr != nil && !acpNotOwned:
+				// A genuine transport-layer failure attempting live delivery
+				// (e.g. tmux.ErrNudgeSubmitUnconfirmed) or any other handle.Nudge
+				// error not covered by the ACP carve-out above.
+				liveErr = nudgeErr
+			case nudgeErr == nil && result.Undelivered != "":
+				// nudgeWaitIdle's OWN structural non-delivery: most notably
+				// NudgeUndeliveredProviderUnsupported, which fires on EVERY
+				// mail notify to a non-claude session (codex included --
+				// nudgeWaitIdle only attempts live delivery for the "claude"
+				// provider family; every other family always lands here). This
+				// is exactly the ops32-p0-codex gap: a codex-templated session
+				// looks identical to a genuinely delivered notify because
+				// gc session nudge's own reporting of this same reason
+				// (queuedNudgeDowngradeNote's "live delivery is unsupported for
+				// %s") had no mail-side equivalent, so `gc mail send` reported
+				// full success while every notification to that session was
+				// silently queued, forever depending on a dispatcher/poller
+				// that may never drain it for a long-lived singleton session.
+				liveErr = fmt.Errorf("live delivery undelivered (%s)", result.Undelivered)
+			}
 		}
 	}
 	if !obs.Running && canRequestManagedNudgeWake(target, store) {
@@ -1393,6 +1453,9 @@ func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.
 	}
 	if obs.Running {
 		maybeStartNudgePoller(target)
+	}
+	if liveErr != nil {
+		return fmt.Errorf("%w for %s: %w", ErrMailNotifyLiveDeliveryUnconfirmed, target.agentKey(), liveErr)
 	}
 	return nil
 }
