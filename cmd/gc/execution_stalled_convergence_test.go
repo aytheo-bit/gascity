@@ -194,7 +194,7 @@ func TestExecutionStalledDrainConvergesToAReclaimableRow(t *testing.T) {
 	// And the loop closes: the row is countable demand again, so a fresh seat is
 	// minted for it, and a fresh seat's query serves it.
 	templates := map[string]struct{}{h.template: {}}
-	if _, servable := demandServableForTemplates(h.env.cfg, reopened, templates); !servable {
+	if _, servable := demandServableForTemplatesAt(h.env.cfg, reopened, templates, time.Now()); !servable {
 		t.Fatal("the reopened row is not demand for its template; the chain does not close")
 	}
 	if !hookClaimMatchesRoute(reopened, hookClaimRouteTargets(h.template)) {

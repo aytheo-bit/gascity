@@ -102,7 +102,7 @@ func TestDemandCountsExactlyWhatTheClaimSideFindsClaimable(t *testing.T) {
 		t.Run(row.name, func(t *testing.T) {
 			bead := postCanonicalizeBead(cfg, row.bead)
 
-			_, counted := demandServableForTemplates(cfg, bead, templates)
+			_, counted := demandServableForTemplatesAt(cfg, bead, templates, demandLoopNow)
 			if counted != row.wantCounted {
 				t.Errorf("counted by demand = %v, want %v", counted, row.wantCounted)
 			}

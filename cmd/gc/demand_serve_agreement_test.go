@@ -180,7 +180,7 @@ func TestDemandCountsExactlyTheClaimableRows(t *testing.T) {
 			// is asserted over the POST-rewrite row.
 			bead := postCanonicalizeBead(cfg, row.bead)
 
-			_, counted := demandServableForTemplates(cfg, bead, templates)
+			_, counted := demandServableForTemplatesAt(cfg, bead, templates, demandLoopNow)
 			if counted != row.wantServable {
 				t.Errorf("counted by demand = %v, want %v", counted, row.wantServable)
 			}
@@ -385,7 +385,7 @@ func TestGoPredicateAndGeneratedQueryAgreeRowByRow(t *testing.T) {
 		t.Run(row.name, func(t *testing.T) {
 			bead := postCanonicalizeBead(cfg, row.bead)
 
-			_, counted := demandServableForTemplates(cfg, bead, templates)
+			_, counted := demandServableForTemplatesAt(cfg, bead, templates, demandLoopNow)
 			served := workerIsServed(bead, opts, metaWant) || legacyWorkflowTierServes(bead, legacyOpts, legacyMetaWant)
 
 			if counted != served {

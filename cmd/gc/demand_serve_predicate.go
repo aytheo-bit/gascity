@@ -41,7 +41,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 )
 
-// demandServableForTemplates reports the template a row is capacity demand for,
+// demandServableForTemplatesAt reports the template a row is capacity demand for,
 // among the templates a store group is counting, or ok=false when no worker for
 // any of them would be served it.
 //
@@ -51,16 +51,12 @@ import (
 // THIS tick. Without the collapse, counting only exact forms would leave a "-N"
 // row counted by neither side — invisible dead work, the dead-drop
 // NormalizePoolRouteTarget exists to close.
-func demandServableForTemplates(cfg *config.City, b beads.Bead, templates map[string]struct{}) (string, bool) {
-	return demandServableForTemplatesAt(cfg, b, templates, time.Now())
-}
-
-// demandServableForTemplatesAt is demandServableForTemplates with the clock
-// supplied. The clock is now load-bearing rather than cosmetic: both of the
-// exclusions this function gained — the deferral half of claimability, and the
-// loop breaker's retry window — are answers about a MOMENT, and a demand count
-// that read a different clock from the claim it is predicting would reintroduce
-// the disagreement at a smaller scale.
+// The clock is load-bearing rather than cosmetic, which is why there is no
+// wall-clock convenience wrapper over this: two of the exclusions below — the
+// deferral half of claimability and the loop breaker's retry window — are
+// answers about a MOMENT, and a demand count that read a different clock from
+// the claim it is predicting would reintroduce, at a smaller scale, the
+// disagreement this file exists to remove. Every caller names its own instant.
 func demandServableForTemplatesAt(cfg *config.City, b beads.Bead, templates map[string]struct{}, now time.Time) (string, bool) {
 	if !demandRowServableAt(b, now) {
 		return "", false
@@ -81,15 +77,9 @@ func demandServableForTemplatesAt(cfg *config.City, b beads.Bead, templates map[
 	return "", false
 }
 
-// demandRowServable applies the route-independent half of the Tier-3 serving
-// rules to one row: the exclusions a worker's query enforces regardless of which
-// template it is asking for.
-func demandRowServable(b beads.Bead) bool {
-	return demandRowServableAt(b, time.Now())
-}
-
-// demandRowServableAt is demandRowServable with the clock supplied, because one
-// of the serving rules is time-dependent.
+// demandRowServableAt applies the route-independent half of the Tier-3 serving
+// rules to one row, as of `now`: the exclusions a worker's query enforces
+// regardless of which template it is asking for.
 func demandRowServableAt(b beads.Bead, now time.Time) bool {
 	// DEFERRAL: the exclusion that was missing, and the one that cost ninety
 	// minutes of provider quota on Node C (OPS-78).
