@@ -1122,6 +1122,45 @@ func TestBuildSupervisorServiceDataExpandsUserManagedPath(t *testing.T) {
 	}
 }
 
+// TestBuildSupervisorServiceDataPathIncludesGCBinaryDir is a regression test
+// for the live Node C failure (nc1-053o): after `gc supervisor install
+// --force` regenerated the unit from a shell whose ambient PATH did not
+// include the pinned gc binary's directory, background order jobs that shell
+// out to a bare `gc` (dolt-health, dolt-remotes-patrol, beads-health,
+// nudge-mail-sweep) failed with exit 127 "sh: 1: gc: not found".
+func TestBuildSupervisorServiceDataPathIncludesGCBinaryDir(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+	// Ambient PATH deliberately excludes the directory of the running test
+	// binary, which gcPath resolves to here (no stable install candidate
+	// matches it).
+	ambientPath := "/usr/local/bin:/usr/bin:/bin"
+	t.Setenv("PATH", ambientPath)
+
+	data, err := buildSupervisorServiceData()
+	if err != nil {
+		t.Fatalf("buildSupervisorServiceData: %v", err)
+	}
+	gcBinDir := filepath.Dir(data.GCPath)
+	if gcBinDir == "" || gcBinDir == "." {
+		t.Fatalf("buildSupervisorServiceData GCPath = %q, want an absolute binary path", data.GCPath)
+	}
+	if slices.Contains(filepath.SplitList(ambientPath), gcBinDir) {
+		t.Skipf("test binary dir %q already in ambient PATH; cannot exercise the regression", gcBinDir)
+	}
+	pathEntries := filepath.SplitList(data.Path)
+	occurrences := 0
+	for _, entry := range pathEntries {
+		if entry == gcBinDir {
+			occurrences++
+		}
+	}
+	if occurrences != 1 {
+		t.Fatalf("buildSupervisorServiceData PATH %q contains gc binary dir %q %d times, want exactly once", data.Path, gcBinDir, occurrences)
+	}
+}
+
 func TestEmitSupervisorLoadCityConfigWarningsOncePerCity(t *testing.T) {
 	var stderr bytes.Buffer
 	prov := &config.Provenance{

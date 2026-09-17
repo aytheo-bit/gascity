@@ -1259,6 +1259,16 @@ func buildSupervisorServiceData() (*supervisorServiceData, error) {
 	if supervisor.UsesIsolatedGCHomeOverride() {
 		xdgRuntimeDir = ""
 	}
+	// The unit's ExecStart pins this exact gc binary, and background order
+	// jobs (dolt-health, beads-health, ...) shell out to a bare `gc`. The
+	// unit's PATH must therefore always contain the pinned binary's own
+	// directory, even when the installer's ambient PATH does not (e.g. a
+	// non-interactive install session) — otherwise those jobs fail with
+	// exit 127 "gc: not found".
+	basePath := os.Getenv("PATH")
+	if gcPath != "" {
+		basePath = filepath.Dir(gcPath) + string(os.PathListSeparator) + basePath
+	}
 	return &supervisorServiceData{
 		GCPath:            gcPath,
 		LogPath:           supervisorLogPath(),
@@ -1266,7 +1276,7 @@ func buildSupervisorServiceData() (*supervisorServiceData, error) {
 		XDGRuntimeDir:     xdgRuntimeDir,
 		LaunchdLabel:      supervisorLaunchdLabel(),
 		SafeName:          sanitizeServiceName(filepath.Base(home)),
-		Path:              searchpath.ExpandPath(homeDir, goruntime.GOOS, os.Getenv("PATH")),
+		Path:              searchpath.ExpandPath(homeDir, goruntime.GOOS, basePath),
 		ExtraEnv:          supervisorServiceExtraEnv(),
 		PortInUseExitCode: supervisorExitCodePortInUse,
 	}, nil
