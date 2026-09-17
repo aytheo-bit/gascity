@@ -876,7 +876,7 @@ func buildDesiredStateWithSessionBeadsAt(
 		})
 		if len(defaultScaleTargets) > 0 {
 			subPhaseStart = time.Now()
-			defaultCounts, defaultDemand, partialTemplates, errs := defaultScaleCheckCountsAndDemand(cfg, defaultScaleTargets, demandReadyCache)
+			defaultCounts, defaultDemand, partialTemplates, errs := defaultScaleCheckCountsAndDemandAt(cfg, defaultScaleTargets, poolDecisionTime, demandReadyCache)
 			recordDemandSubPhase(trace, "demand_snapshot.default_scale_demand", subPhaseStart, map[string]any{
 				"targets": len(defaultScaleTargets),
 			})
@@ -969,6 +969,12 @@ func buildDesiredStateWithSessionBeadsAt(
 			poolDecisionTime,
 			trace,
 		)
+		// OPS-78: charge each seat this tick mints against the row that
+		// justified it, and stop counting a row that has consumed
+		// demandLoopStrikeLimit seats without ever being claimed. Runs here
+		// rather than on the seat's own drain path because the drain is in
+		// another process and best-effort by design — see demand_loop_breaker.go.
+		recordDemandSeatMints(poolDesiredStates, store, rigStores, poolDecisionTime, stderr)
 		bp.configurePoolSessionCreateFairShare(poolDesiredStates)
 		for _, poolState := range poolDesiredStates {
 			cfgAgent := findAgentByTemplate(cfg, poolState.Template)
@@ -1901,11 +1907,20 @@ func defaultScaleCheckTargetForAgent(
 // that need normalization should call defaultScaleCheckCountsAndDemand
 // directly with a real *config.City.
 func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int, map[string]bool, []error) {
-	counts, _, partialTemplates, errs := defaultScaleCheckCountsAndDemand(nil, targets)
+	counts, _, partialTemplates, errs := defaultScaleCheckCountsAndDemandAt(nil, targets, time.Now())
 	return counts, partialTemplates, errs
 }
 
 func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCheckTarget, caches ...*readyDemandCache) (map[string]int, map[string]scaleCheckDemand, map[string]bool, []error) {
+	return defaultScaleCheckCountsAndDemandAt(cfg, targets, time.Now(), caches...)
+}
+
+// defaultScaleCheckCountsAndDemandAt is defaultScaleCheckCountsAndDemand with
+// the tick's clock supplied. The demand predicate's deferral and loop-breaker
+// exclusions are both answers about a moment, so the whole pass must read ONE
+// clock — the same poolDecisionTime the seats minted from this count are
+// charged against.
+func defaultScaleCheckCountsAndDemandAt(cfg *config.City, targets []defaultScaleCheckTarget, at time.Time, caches ...*readyDemandCache) (map[string]int, map[string]scaleCheckDemand, map[string]bool, []error) {
 	cache := optionalReadyDemandCache(caches)
 	counts := make(map[string]int, len(targets))
 	demand := make(map[string]scaleCheckDemand, len(targets))
@@ -1979,7 +1994,7 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 			// A routed epic, a bead on a dispatch hold, or a slot-suffixed route
 			// is not capacity demand — it is a seat that spawns, reads empty and
 			// drains, every tick, forever. See demand_serve_predicate.go.
-			template, servable := demandServableForTemplates(cfg, b, group.templates)
+			template, servable := demandServableForTemplatesAt(cfg, b, group.templates, at)
 			if !servable {
 				continue
 			}

@@ -373,6 +373,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 			register(newCensusOwnerLivenessCheck(cfg, cityPath, storeFactory))
 			register(newRunTargetRoutedToBackfillCheck(cfg, cityPath, storeFactory))
 			register(newRouteRecoveryQuarantineCheck(cfg, cityPath, storeFactory))
+			register(newDemandLoopQuarantineCheck(cfg, cityPath, storeFactory))
 			register(newHoldLabelRoutedToCheck(cfg, cityPath, storeFactory))
 			register(newPoolIdleRoutedWorkCheck(cfg, cityPath, storeFactory))
 			register(newWorkOptionMetadataMigrationCheck(cfg, cityPath, storeFactory))

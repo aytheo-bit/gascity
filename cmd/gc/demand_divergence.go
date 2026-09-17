@@ -114,10 +114,11 @@ func classifyDemandTrigger(triggerID, dir string, opts hookClaimOptions, ops hoo
 	// template: open, unassigned, route-matching, and not excluded by the shared
 	// serving rules. Anything else — a row that moved on, a sibling claim — is
 	// correct pull.
-	if status != "open" || !demandRowServable(bead) || !hookClaimMatchesRoute(bead, opts.RouteTargets) {
+	now := ops.nowOrWallClock()
+	if status != "open" || !demandRowServableAt(bead, now) || !hookClaimMatchesRoute(bead, opts.RouteTargets) {
 		return status, events.DemandClaimBenign
 	}
-	switch classifyDemandRowClaimability(bead, ops.nowOrWallClock()) {
+	switch classifyDemandRowClaimability(bead, now) {
 	case demandRowClaimable:
 		// Open, servable, route-matching, and claimable right now — the agreement
 		// invariant breaking.
@@ -135,6 +136,15 @@ func classifyDemandTrigger(triggerID, dir string, opts hookClaimOptions, ops hoo
 	default:
 		// Deferred: gated by defer_until (or bd's indefinite deferral), a fresh
 		// bead-local field, so draining past it is correct pull.
+		//
+		// Since OPS-78 this arm is unreachable from here, and that unreachability
+		// is the fix rather than dead code: demandRowServableAt now applies the
+		// same deferral exclusion above, on the same clock, so a deferred row
+		// short-circuits to benign before the switch. It is kept because it is
+		// the statement of what a deferred row means to this classifier, and
+		// because the two predicates agreeing is a property a test asserts
+		// (TestDemandCountsExactlyWhatTheClaimSideFindsClaimable) rather than
+		// something this switch may assume.
 		return status, events.DemandClaimBenign
 	}
 }

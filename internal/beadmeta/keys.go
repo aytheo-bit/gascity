@@ -112,6 +112,19 @@ const (
 	// is a pre-fence candidate that idempotency recovery either activates
 	// (deterministically, when it is the surviving candidate) or neutralizes.
 	AttachFencePendingMetadataKey        = "gc.attach_fence_pending"
+	// DemandLoopStrikesMetadataKey is the demand/claim loop breaker's ledger on
+	// the row itself: "<strikes>|<lastMintRFC3339>|<fingerprint>". It has to be
+	// ON THE BEAD rather than in controller memory because the two halves of the
+	// loop run in different processes — the controller counts the row and mints
+	// the seat, and the seat's own `gc hook --claim` is what discovers the row
+	// was never claimable. The store is the only thing both of them see.
+	DemandLoopStrikesMetadataKey = "gc.demand_loop_strikes"
+	// DemandLoopQuarantinedMetadataKey marks a row the breaker has stopped
+	// counting as demand, and DemandLoopQuarantineReasonMetadataKey says why. It
+	// is the index the `demand-loop-quarantine` doctor check queries on, the same
+	// way the route-recovery pair is.
+	DemandLoopQuarantinedMetadataKey      = "gc.demand_loop_quarantined"
+	DemandLoopQuarantineReasonMetadataKey = "gc.demand_loop_quarantine_reason"
 	DeferredAssigneeMetadataKey          = "gc.deferred_assignee"
 	DeferredExecutionRoutedToMetadataKey = "gc.deferred_execution_routed_to"
 	DeferredRoutedToMetadataKey          = "gc.deferred_routed_to"
@@ -547,6 +560,9 @@ var KnownMetadataKeys = []string{
 	RootSettleFailedAtMetadataKey,
 	RootSettleFailedMetadataKey,
 	RootStoreRefMetadataKey,
+	DemandLoopStrikesMetadataKey,
+	DemandLoopQuarantinedMetadataKey,
+	DemandLoopQuarantineReasonMetadataKey,
 	RouteQuarantineMetadataKey,
 	RouteQuarantineReasonMetadataKey,
 	RoutedToMetadataKey,

@@ -52,7 +52,24 @@ import (
 // row counted by neither side — invisible dead work, the dead-drop
 // NormalizePoolRouteTarget exists to close.
 func demandServableForTemplates(cfg *config.City, b beads.Bead, templates map[string]struct{}) (string, bool) {
-	if !demandRowServable(b) {
+	return demandServableForTemplatesAt(cfg, b, templates, time.Now())
+}
+
+// demandServableForTemplatesAt is demandServableForTemplates with the clock
+// supplied. The clock is now load-bearing rather than cosmetic: both of the
+// exclusions this function gained — the deferral half of claimability, and the
+// loop breaker's retry window — are answers about a MOMENT, and a demand count
+// that read a different clock from the claim it is predicting would reintroduce
+// the disagreement at a smaller scale.
+func demandServableForTemplatesAt(cfg *config.City, b beads.Bead, templates map[string]struct{}, now time.Time) (string, bool) {
+	if !demandRowServableAt(b, now) {
+		return "", false
+	}
+	// OPS-78, the residual half. Everything above this line excludes a row for a
+	// reason somebody enumerated; this excludes a row that has repeatedly been
+	// counted, repeatedly had a seat minted for it, and never once been claimed
+	// — whatever the reason turns out to be. See demand_loop_breaker.go.
+	if demandLoopQuarantineActive(b, now) {
 		return "", false
 	}
 	for _, candidate := range controllerDemandRouteCandidates(b) {
@@ -68,6 +85,43 @@ func demandServableForTemplates(cfg *config.City, b beads.Bead, templates map[st
 // rules to one row: the exclusions a worker's query enforces regardless of which
 // template it is asking for.
 func demandRowServable(b beads.Bead) bool {
+	return demandRowServableAt(b, time.Now())
+}
+
+// demandRowServableAt is demandRowServable with the clock supplied, because one
+// of the serving rules is time-dependent.
+func demandRowServableAt(b beads.Bead, now time.Time) bool {
+	// DEFERRAL: the exclusion that was missing, and the one that cost ninety
+	// minutes of provider quota on Node C (OPS-78).
+	//
+	// classifyDemandRowClaimability has always known a deferred row is not
+	// claimable, and says so in its own doc comment — "a worker's Tier-3 ready
+	// query excludes both a blocked and a deferred row". But only the DIVERGENCE
+	// CLASSIFIER consulted it. The demand count did not, so the two readers
+	// disagreed about exactly this row shape: the controller counted it, minted
+	// a seat, the seat's query refused to serve it, the seat drained, and the
+	// row — unchanged — was counted again on the next tick.
+	//
+	// This is also why deferring the four beads on the night of 2026-09-17 made
+	// the rate fall without stopping: a live ready read does filter deferral
+	// (beads.IsReadyCandidateForTier), so most deferred rows never reach here —
+	// but controllerDemandReady deliberately backfills a failed or partial live
+	// read from the cached snapshot, and a row deferred after that snapshot was
+	// primed arrives here still looking ready. The backfill is the right
+	// trade-off and is staying; what was missing is this side re-checking the
+	// bead-local fields, which are FRESH on every read and cost nothing.
+	//
+	// Only the DEFERRED arm is folded in. demandRowBlockednessUnproven must not
+	// be: an absent is_blocked projection is the reading production hands every
+	// live read (classifyDemandRowClaimability documents this at length), so
+	// treating "unproven" as unservable here would drive demand to zero
+	// city-wide and drain every pool. Settling it properly needs a live
+	// dependency read per row per tick, which does not belong on the reconcile
+	// hot path. That leaves blockedness as the one named, deliberate residual of
+	// this predicate — and it is the residual the loop breaker exists to bound.
+	if classifyDemandRowClaimability(b, now) == demandRowDeferred {
+		return false
+	}
 	rules := config.PoolDemandServeRulesForQuery()
 	if rules.RequireUnassigned && strings.TrimSpace(b.Assignee) != "" {
 		return false
