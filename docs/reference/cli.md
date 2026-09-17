@@ -2675,6 +2675,18 @@ if this node's filesystem was already compromised before you ran this
 command — it only catches a key blob that was tampered with, or a wrong
 key pasted, in this one step.
 
+This command intentionally has NO managed-session gate (unlike "init" and
+"sign"): it is meant to be safe to run from inside a spawned session,
+because it can never leak or require the private key. That same lack of a
+gate means a spawned session on this node can itself run "gc mail trust
+import --force &lt;any key&gt;" and silently replace this node's trusted key with
+one of its own choosing, with its completely ordinary session environment
+intact — no elevated access or env-stripping needed. This is an accepted,
+currently-undefended gap (see docs/reference/trust-boundaries.md's
+"same-UID trust anchor replacement"), not something --force or
+--expect-fingerprint close against an adversary with the node's own shell
+access.
+
 ```
 gc mail trust import <base64-public-key> [flags]
 ```

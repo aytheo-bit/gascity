@@ -1101,11 +1101,16 @@ func isReservedMailIdentity(sender string) bool {
 // thinking, or whose GC_AGENT happens to be set to one of those literal
 // strings — not a boundary that withstands a determined adversary who knows
 // to strip their own environment, and NOT a substitute for
-// gc mail send --sign (see internal/humantrust), which is the actual
-// forge-proof mechanism: this function has no way to distinguish a genuinely
-// unmanaged human shell from a session that stripped its own env, but
-// --sign's private key is never in that session's reach regardless of what
-// its environment claims. Treat [CreatedByMetadataKey] the same way: it is a
+// gc mail send --sign (see internal/humantrust), which closes THIS
+// function's specific blind spot: this function has no way to distinguish a
+// genuinely unmanaged human shell from a session that stripped its own env,
+// but --sign's private key is never in that session's reach regardless of
+// what its environment claims. --sign is not itself a complete forge-proof
+// mechanism, though: internal/humantrust and docs/reference/trust-
+// boundaries.md document a separate, independent, currently-unclosed gap
+// (a same-UID session replacing the trust anchor it verifies against, no
+// private key needed) that this function's env-var check has nothing to do
+// with either way. Treat [CreatedByMetadataKey] the same way: it is a
 // same-trust-domain breadcrumb, not independent verification. See
 // TestCmdMailSendKnownLimitationEnvStripBypassesHumanGate for the pinned,
 // intentionally-unclosed regression case.

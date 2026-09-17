@@ -23,10 +23,17 @@ import (
 // what makes it safe is that the operator only ever runs these commands on
 // a machine with no shared filesystem with any node that spawns sessions.
 //
-// "show" and "import" only ever handle the PUBLIC key and are safe to run
-// anywhere, including on a node that spawns sessions — "import" is in fact
-// meant to be run there, once per node, to provision that node's read-side
-// verification without ever giving it the private key.
+// "show" and "import" only ever handle the PUBLIC key, which means neither
+// can ever leak or require the private key — "import" is in fact meant to
+// be run on a node that spawns sessions, once per node, to provision that
+// node's read-side verification. "Safe" here is scoped to confidentiality
+// only, though: "import" has no managed-session gate and, by design, will
+// happily overwrite the node's trusted key (with --force) for ANY caller,
+// including a spawned session replacing it with a key of its own. That is
+// an accepted, currently-undefended integrity gap — see internal/humantrust
+// and docs/reference/trust-boundaries.md's "same-UID trust anchor
+// replacement" material — not something this command's own "safe to run
+// anywhere" framing should be read to rule out.
 func newMailTrustCmd(stdout, stderr io.Writer) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "trust",
@@ -284,7 +291,19 @@ command itself refuse a mismatch, rather than relying only on a manual
 comparison afterward. This does not eliminate the risk of a pre-planted key
 if this node's filesystem was already compromised before you ran this
 command — it only catches a key blob that was tampered with, or a wrong
-key pasted, in this one step.`,
+key pasted, in this one step.
+
+This command intentionally has NO managed-session gate (unlike "init" and
+"sign"): it is meant to be safe to run from inside a spawned session,
+because it can never leak or require the private key. That same lack of a
+gate means a spawned session on this node can itself run "gc mail trust
+import --force <any key>" and silently replace this node's trusted key with
+one of its own choosing, with its completely ordinary session environment
+intact — no elevated access or env-stripping needed. This is an accepted,
+currently-undefended gap (see docs/reference/trust-boundaries.md's
+"same-UID trust anchor replacement"), not something --force or
+--expect-fingerprint close against an adversary with the node's own shell
+access.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if cmdMailTrustImport(args[0], force, expectFingerprint, stdout, stderr) != 0 {

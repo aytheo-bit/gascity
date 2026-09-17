@@ -1,9 +1,28 @@
 // Package humantrust implements the cryptographic trust root that lets a
 // genuinely authenticated human operator (or an explicitly provisioned
 // trusted relay process) mark a mail message as verified-reserved-identity
-// ("human" or "controller") in a way that a spawned gc session's own process
-// cannot forge — not "hard to forge," genuinely unable to, because the
-// private key is never present on any filesystem a spawned session can read.
+// ("human" or "controller") in a way that a spawned gc session cannot forge
+// BY LOADING THE OPERATOR'S OWN REAL PRIVATE KEY — that specific key is
+// never present on any filesystem a spawned session can read.
+//
+// Read that sentence narrowly; it is the whole guarantee, not a shorthand
+// for a broader one. "The operator's private key cannot be reached" is a
+// real, proven property. "A spawned session cannot forge verified mail" is
+// NOT proven and is not true: a session running as the same OS user as a
+// verifying node can replace the PUBLIC key that node trusts with one of
+// its own choosing — no private key required, no elevated access required,
+// and (for the CLI path, `gc mail trust import`) no managed-session gate
+// stands in the way even without doing that — then self-sign its own
+// "verified" mail. This is proven, as currently-accepted behavior, by
+// TestSameUIDSessionCanReplaceTrustAnchorAndForgeVerifiedMail and
+// TestSameUIDSessionCanReplaceTrustAnchorViaRawFileWrite in
+// cmd/gc/cmd_mail_trust_relay_test.go. See "What this does NOT prove" below
+// and docs/reference/trust-boundaries.md's "same-UID trust anchor
+// replacement" material for the full scope of what this package does and
+// does not close. Closing that second gap needs real privilege separation
+// (a different OS user, process, or container for spawned sessions), which
+// gascity does not have anywhere today and which this package does not
+// attempt to provide.
 //
 // # Why this exists
 //
@@ -83,21 +102,33 @@
 //     SSH), a process on that target node — spawned session or not — cannot
 //     load a key that was never placed there. It is not a claim that gc
 //     itself prevents operator misuse of its own tooling.
-//   - The public-key-import step is trust-on-first-use: whoever has write
-//     access to a verifying node's trust directory before (or instead of) a
-//     legitimate `gc mail trust import` can plant their own public key,
-//     paired with their own privately-held key, and their own self-signed
-//     mail then verifies on that node exactly as if it were genuine. This
-//     is why `gc mail trust import` refuses to silently overwrite an
-//     existing public key without --force, supports --expect-fingerprint
-//     for a same-command sanity check, and why operators are told (see
-//     docs/reference/trust-boundaries.md) to compare the fingerprint
-//     `gc mail trust show` reports on the target node, out-of-band (a
-//     voice call, a separate already-trusted channel — never the same
-//     channel the key blob traveled over), against the fingerprint printed
-//     at `trust init` time. That check is only as good as the operator's
-//     diligence in actually performing it, every time a key is imported,
-//     not just once.
+//   - The public-key-import step is not merely trust-on-first-use, it is
+//     trust-ANY-time-use: whoever can write to a verifying node's trust
+//     directory can plant their own public key, paired with their own
+//     privately-held key, and their own self-signed mail then verifies on
+//     that node exactly as if it were genuine — not only before a
+//     legitimate `gc mail trust import` (the classic TOFU risk this
+//     package's earlier docs described), but at ANY time AFTER one too,
+//     repeatedly. `gc mail trust import` has NO managed-session gate at
+//     all (unlike `init` and `sign`), so a spawned session can run
+//     `gc mail trust import --force <its own key>` with its completely
+//     ordinary session environment intact — no env-stripping required — and
+//     replace an already-correctly-provisioned node's trust anchor. A
+//     session does not even need `gc` for this: the public key file is
+//     plain 0644 inside a 0700 directory owned by the session's own OS
+//     user, so a direct file write accomplishes the same replacement with
+//     no `gc` invocation at all. `--force` and `--expect-fingerprint` only
+//     raise the bar against an operator's own mistake or an outsider
+//     without shell access to the node; neither stops a same-UID
+//     adversary willing to pass --force or bypass `gc` entirely. See
+//     TestSameUIDSessionCanReplaceTrustAnchorAndForgeVerifiedMail and
+//     TestSameUIDSessionCanReplaceTrustAnchorViaRawFileWrite in
+//     cmd/gc/cmd_mail_trust_relay_test.go for the empirical proof, and
+//     docs/reference/trust-boundaries.md for the accepted-risk statement.
+//     Closing this for real needs privilege separation (a different OS
+//     user, process, or container for spawned sessions) that gascity does
+//     not have anywhere today — tracked as separate infrastructure work,
+//     not something this package attempts.
 //   - Everything unrelated to key location is unchanged and still holds:
 //     the signature only bounds validity to MaxSignatureAge and is not full
 //     replay protection, the subject/title line is never signed, only the

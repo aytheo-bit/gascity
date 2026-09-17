@@ -1121,6 +1121,15 @@ func TestCmdMailSendSignRefusedWhenManagedSessionEnvSet(t *testing.T) {
 // TestSpawnedSessionCannotForgeVerifiedMailWhenPrivateKeyNeverTouchesItsNode
 // in cmd_mail_trust_relay_test.go. This test still earns its place as a fast,
 // pure-function check of the refusal logic itself.
+//
+// SCOPE CAVEAT: this test's condition is "no trust key is loadable at all" —
+// it says nothing about, and does not test, what happens once a session can
+// make its OWN key loadable as the node's trusted one (trust-anchor
+// replacement via "gc mail trust import --force" or a direct file write,
+// with no managed-session gate involved). See
+// TestSameUIDSessionCanReplaceTrustAnchorAndForgeVerifiedMail and
+// TestSameUIDSessionCanReplaceTrustAnchorViaRawFileWrite in
+// cmd_mail_trust_relay_test.go for that separate, currently-unclosed gap.
 func TestCmdMailSendSignCannotForgeVerificationWithoutTrustKey(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_MAIL", "")

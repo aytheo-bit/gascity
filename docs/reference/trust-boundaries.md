@@ -95,8 +95,13 @@ follow-up.
 cross-machine counterpart `gc mail send --signed-envelope`, produce a message
 that a reader can independently confirm really was produced by whoever holds
 a specific Ed25519 private key — **without trusting the sending process's
-environment at all**, closing the class of bypass above for good rather than
-raising the bar on it.
+environment at all**, closing the ORIGINAL env-strip / shared-`$HOME` bypass
+class above for good: a session can no longer load and reuse the
+**operator's own real** private key. That is narrower than "closes every way
+to forge verified mail" — it is not that, and this document no longer
+describes it that way. A second, independent gap (a same-UID session
+replacing the trust anchor itself, no private key required) is not closed by
+this mechanism at all; see "What this does NOT prove" below.
 
 **A first version of this mechanism had a real, empirically confirmed gap.**
 The initial design generated the keypair and signed on whatever machine ran
@@ -202,7 +207,13 @@ trust import --expect-fingerprint <hex>` makes this an enforced check
 rather than a manual one: pass the fingerprint you confirmed out-of-band and
 the import itself refuses on a mismatch.
 
-**What this proves (with empirical adversarial evidence).**
+**What this proves (with empirical adversarial evidence) — and only this.**
+The tests below prove that a session cannot load and use the **operator's
+real** private key; they do not prove, and were never meant to prove, that
+verified mail cannot be forged by any means. A second, independent gap
+(same-UID trust-anchor replacement, no private key involved at all) is
+proven to currently succeed by a deliberately-passing test — see "What this
+does NOT prove" below.
 `internal/humantrust/humantrust_test.go` proves the crypto and the new
 envelope/public-key-only primitives in isolation (`TestEnvelopeRoundTrip`,
 `TestEnvelopeVerifiesAgainstOnlyThePublicKey`,
@@ -247,30 +258,64 @@ next read, so verification is recomputed from live content, not cached.
   works today (an operator's own machine, or a CI/relay host, reaching a
   node over SSH) — it is not a claim that gc prevents an operator from
   misusing its own tooling.
-- **The public-key import step is trust-on-first-use.** Whoever has write
-  access to a verifying node's trust directory before (or instead of) a
-  legitimate `gc mail trust import` can plant their own public key, paired
-  with their own privately-held key, and their own self-signed mail then
-  verifies on that node exactly as if it were genuine. `gc mail trust
-  import` refuses to silently overwrite an existing public key without
-  `--force`, and `--expect-fingerprint` lets the command itself enforce an
-  out-of-band-confirmed fingerprint — but this is only as good as the
-  operator's diligence in actually comparing fingerprints over a separate
-  channel, every time a key is imported, not just once. If a node's
-  filesystem was already compromised before the operator ever ran `import`
-  on it, nothing here catches that.
-- **No privilege separation on this host, for anything other than the
-  trust key.** gascity has no separation between the orchestrator process
-  and a spawned session's process: both still run as the same OS user with
-  no setuid, container, or namespace boundary (confirmed by reading
-  `internal/session/lifecycle.go` and `internal/runtime/tmux`). This
-  redesign removes the *private signing key* specifically from that shared
-  filesystem; it does nothing for other same-host secrets. A session that
-  goes further and directly reads arbitrary files as that same OS user can
-  still read anything else readable by its UID — e.g.
-  `internal/convergence`'s controller token, a pre-existing, separately
-  acknowledged gap (see the comment in `cmd/gc/controller.go` about keeping
-  that token out of `os.Environ()`).
+- **The public-key import step is not trust-on-first-use, it is
+  trust-ANY-time-use — this is a same-UID adversary's open door, not a
+  historical footnote.** Whoever can write to a verifying node's trust
+  directory can plant their own public key, paired with their own
+  privately-held key, and their own self-signed mail then verifies on that
+  node exactly as if it were genuine. Earlier drafts of this document
+  described this risk as something that happens "before (or instead of)" a
+  legitimate `gc mail trust import` — that framing was itself incomplete.
+  The identical plant works **after** a legitimate import too, at any time,
+  repeatedly, using the tool's own `--force` flag: `gc mail trust import`
+  has **no managed-session gate at all** (unlike `init` and `sign`), so an
+  ordinary spawned session — its completely normal `GC_SESSION_ID`/
+  `GC_ALIAS`/`GC_AGENT` intact, no env-stripping needed for this step —
+  can run `gc mail trust import --force <its own key>` and silently replace
+  an already-correctly-provisioned node's trust anchor, which also locks
+  out the real operator (their genuine envelope stops verifying against
+  the replaced key). A session does not even need `gc` for this: the
+  public key file is plain 0644 inside a 0700 directory owned by the
+  session's own OS user, so a direct file write accomplishes the exact same
+  replacement with no `gc` invocation at all. This is proven as
+  **current, accepted behavior** — not a bug this document is reporting for
+  someone to fix — by `TestSameUIDSessionCanReplaceTrustAnchorAndForgeVerifiedMail`
+  and `TestSameUIDSessionCanReplaceTrustAnchorViaRawFileWrite` in
+  `cmd/gc/cmd_mail_trust_relay_test.go`, both of which pass by confirming
+  the attack succeeds. `--force` refusing a silent overwrite and
+  `--expect-fingerprint` enforcing an out-of-band-confirmed fingerprint are
+  real, worthwhile speed bumps against an operator's own mistake or an
+  outsider with no shell access to the node — but neither stops a same-UID
+  adversary who is simply willing to pass `--force`, or to skip `gc`
+  entirely. Comparing fingerprints out-of-band (see below) is still worth
+  doing; it just does not close this gap, because the adversary here already
+  has exactly the access needed to make the fingerprint say whatever they
+  like.
+- **No privilege separation on this host — and that now includes the
+  public trust anchor itself, not just "other" secrets.** gascity has no
+  separation between the orchestrator process and a spawned session's
+  process: both still run as the same OS user with no setuid, container, or
+  namespace boundary (confirmed by reading `internal/session/lifecycle.go`
+  and `internal/runtime/tmux`). This redesign removes the *private signing
+  key* specifically from that shared filesystem, and that part holds up:
+  `TestSpawnedSessionCannotForgeVerifiedMailWhenPrivateKeyNeverTouchesItsNode`
+  is real, adversarially-proven evidence that a session cannot load the
+  operator's actual private key. But the redesign does nothing to protect
+  the **public** key a node verifies against, and a same-UID adversary does
+  not need the private key at all to defeat verification — see the
+  trust-anchor-replacement bullet above. That gap is the SAME CLASS as a
+  pre-existing, separately acknowledged residual risk this codebase already
+  accepts for `internal/convergence`'s controller token (see the comment in
+  `cmd/gc/controller.go` about keeping that token out of `os.Environ()`
+  specifically to limit — not eliminate — same-host exposure): both the
+  controller token and the trust-anchor public key are ordinary files
+  readable and writable by whatever OS user a spawned session runs as, and
+  both need the identical fix to close for real — genuine privilege
+  separation (a different OS user, process, or container for spawned
+  sessions) — which gascity does not have anywhere today. Designing or
+  building that privilege-separation infrastructure is explicitly out of
+  scope for this design; it is tracked as separate infrastructure work, not
+  something `internal/humantrust` or this document attempts to solve.
 - **Bounded validity window, not full replay protection.** A signature is
   only accepted within `internal/humantrust.MaxSignatureAge` (15 minutes) of
   its claimed issuance time, but there is no nonce or used-signature ledger:
@@ -316,11 +361,15 @@ next read, so verification is recomputed from live content, not cached.
   threat model to begin with.
 
 Do not describe the env-var gate as verifying who sent a message — it never
-does. Do describe `Message.Verified` as an actual cryptographic confirmation,
-scoped exactly as this section states. Do describe the private key as never
-touching a node that spawns sessions **when the documented flow is
-followed** — not as something gc itself guarantees regardless of how an
-operator chooses to run it.
+does. Do describe `Message.Verified` as an actual cryptographic confirmation
+that a message matches whatever public key the target node currently
+trusts — not as proof of who sent it in an absolute sense, since that trust
+anchor itself can be replaced by any process running as the node's own OS
+user (see "same-UID trust-anchor replacement" above). Do describe the
+private key as never touching a node that spawns sessions **when the
+documented flow is followed** — not as something gc itself guarantees
+regardless of how an operator chooses to run it, and not as a claim that
+verified mail cannot be forged by other means.
 
 ## Rules For Authors
 
