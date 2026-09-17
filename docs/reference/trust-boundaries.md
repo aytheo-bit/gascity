@@ -89,37 +89,81 @@ to reach 127.0.0.1:9443, with no per-caller authentication. Closing this needs
 a caller-authentication design (e.g. per-session tokens) and remains a
 follow-up.
 
-### Cryptographic verification: `gc mail send --sign` (internal/humantrust)
+### Cryptographic verification: verified mail (internal/humantrust)
 
-`gc mail send --from human --sign` (or `--from controller --sign`) produces a
-message that a reader can independently confirm really was produced by
-whoever holds a specific Ed25519 private key — **without trusting the sending
-process's environment at all**, closing the class of bypass above for good
-rather than raising the bar on it.
+`gc mail send --from human --sign` (or `--from controller --sign`), and its
+cross-machine counterpart `gc mail send --signed-envelope`, produce a message
+that a reader can independently confirm really was produced by whoever holds
+a specific Ed25519 private key — **without trusting the sending process's
+environment at all**, closing the class of bypass above for good rather than
+raising the bar on it.
 
-**Design.** A human operator runs `gc mail trust init`, once, directly in
-their own terminal (never as a side effect of anything a spawned session
-does — the command refuses outright when a managed-session identity env var
-is present). This generates an Ed25519 keypair and writes:
+**A first version of this mechanism had a real, empirically confirmed gap.**
+The initial design generated the keypair and signed on whatever machine ran
+`gc mail send --sign`, gated only on the absence of a managed-session
+identity env var. Independent review then proved, empirically — by
+provisioning a real key and loading it from a stripped-env process, the same
+way the original env-var gate was defeated — that gascity's spawned sessions
+never get their own `GC_HOME` (`internal/session/lifecycle.go` never sets
+one), so `internal/gchome.Default()` resolves to the operator's **real**
+`$HOME/.gc` for a spawned session exactly as it does for the operator. A
+process that merely stripped `GC_SESSION_ID`/`GC_ALIAS`/`GC_AGENT` — the
+exact original bypass shape — could load the operator's real private key from
+that shared home directory and produce a genuinely verifying signature.
+"Different `GC_HOME`" (what the first version's tests asserted) was never the
+same thing as "different machine" (what a spawned session actually is
+relative to the key), and describing it that way was itself part of the gap.
 
-- the **private** key to `<Gas City home>/trust/human_signing_ed25519.key`
-  (mode 0600) — `internal/humantrust.PrivateKeyPath()`, resolved via
-  `internal/gchome` (`$GC_HOME` or `~/.gc`), a machine-local path distinct
-  from any city directory a spawned session's working directory might
-  overlap with;
-- the **public** key alongside it, mode 0644 — safe to read from anywhere,
-  including inside a spawned session, because knowing a public key does not
-  let you forge a signature under it.
+**The design below is the fix, and it changes where the private key is
+allowed to exist, not just how it's gated.**
 
-`gc mail send --sign` signs `(identity, recipient, body, issuedAt)` with the
-private key (`internal/humantrust.Sign`) and stores the signature, claimed
-identity, and issuance time as ordinary message metadata
-(`mail.verified_signature`, `mail.verified_identity`,
-`mail.verified_issued_at`). It refuses outright — never silently falling back
-to an unsigned send — when: this process carries a managed-session identity
-env var; the sender is not a reserved identity; or no private key is
-loadable (`internal/humantrust.ErrKeyNotFound`, pointing the caller at
-`gc mail trust init`).
+**Design: the private key never touches a node that spawns sessions.**
+gascity's real deployment already has a genuine machine boundary: the human
+operator (or an explicitly authorized relay) issues mail from a *separate*
+machine, reaching the node that runs the orchestrator and every spawned
+session over SSH. Spawned sessions run entirely on that node's own
+filesystem and OS user, with no network path back to the operator's own
+machine. This design puts the private key only where that boundary actually
+protects it:
+
+- A human operator runs `gc mail trust init`, once, **on their own machine**
+  (or an explicitly provisioned trusted relay machine) — never on a node that
+  runs the gascity orchestrator or any spawned session. This generates an
+  Ed25519 keypair and writes the **private** key to
+  `<Gas City home>/trust/human_signing_ed25519.key` (mode 0600) —
+  `internal/humantrust.PrivateKeyPath()`, resolved via `internal/gchome`
+  (`$GC_HOME` or `~/.gc`) **on that machine**. Nothing about `gc mail trust
+  init`'s own execution can verify "this is the right machine" — that check
+  is a deployment discipline the operator follows, not something the tool
+  can detect about the host it happens to run on (see "What this does NOT
+  prove" below).
+- The **public** key is safe to distribute anywhere, including onto every
+  node that verifies mail — knowing it does not let you forge a signature.
+  `gc mail trust show` prints it (and its fingerprint) for the operator to
+  copy; `gc mail trust import <base64-key>` writes **only** the public key
+  on a verifying node (`internal/humantrust.WritePublicKeyOnly`) — there is
+  no code path in `import` that creates, receives, or requires the private
+  key, so running it on a node that spawns sessions does not reintroduce the
+  gap above.
+- **Signing happens on the key-holding machine.** `gc mail trust sign <to>
+  <body>` loads the private key and produces a portable, self-contained
+  envelope (`internal/humantrust.Envelope`, via `BuildEnvelope`/
+  `EncodeEnvelope`) — identity, recipient, subject, body, issuance time, and
+  signature, safe to relay as a single opaque token over SSH or a pasted
+  terminal argument. The target node accepts it with `gc mail send
+  --signed-envelope <token>` (or `-` to read the token from stdin): that
+  command decodes the envelope, resolves the recipient exactly as an
+  ordinary send would, locally re-verifies the signature against the
+  **public** key already provisioned there (no private key involved), and
+  only then stores it. `gc mail send --sign` (loading the private key and
+  signing in the same process that sends) still exists for the case where
+  that process genuinely IS the key-holding machine — the same "never on a
+  node that spawns sessions" constraint governs both.
+- Either way, the signature and issuance time are stored as ordinary message
+  metadata (`mail.verified_signature`, `mail.verified_identity`,
+  `mail.verified_issued_at`). Every signing surface refuses outright — never
+  silently falling back to an unsigned send — rather than accept a claim it
+  cannot back with a real signature.
 
 **Verification never trusts the metadata's own say-so.** Every reader
 (`beadmail.beadToMessage`, exercised by `gc mail check --inject`, `gc mail
@@ -139,79 +183,120 @@ Messages that verify are rendered with a distinct
 `<system-reminder>` block `gc mail check --inject` produces
 (`formatInjectOutput`). Every other message — everything sent before this
 mechanism existed, and any `--from human`/`--from controller` send made
-without `--sign` — renders exactly as before, with no marker, and
-`Message.Verified` is `false`. Introducing a real verified category does not
-make the unverified category look more trustworthy by comparison; it stays
-exactly as skeptically treated as it always was.
+without `--sign`/`--signed-envelope` — renders exactly as before, with no
+marker, and `Message.Verified` is `false`. Introducing a real verified
+category does not make the unverified category look more trustworthy by
+comparison; it stays exactly as skeptically treated as it always was.
+
+**Out-of-band fingerprint verification (do this on every provisioning
+step).** `gc mail trust init`, `gc mail trust show`, and `gc mail trust
+import` all print the key's fingerprint (`internal/humantrust.Fingerprint`).
+Because a public key is only trustworthy if the copy a verifying node
+imported is really the operator's, and not a key an attacker with prior
+write access to that node's trust directory planted (paired with their own
+privately-held key — see "What this does NOT prove"), compare the
+fingerprint `gc mail trust import`/`gc mail trust show` reports on the
+target node against the fingerprint printed at `gc mail trust init` time,
+over a channel other than the one the key blob traveled over. `gc mail
+trust import --expect-fingerprint <hex>` makes this an enforced check
+rather than a manual one: pass the fingerprint you confirmed out-of-band and
+the import itself refuses on a mismatch.
 
 **What this proves (with empirical adversarial evidence).**
-`internal/humantrust/humantrust_test.go`,
-`internal/mail/beadmail/beadmail_test.go`, and
-`cmd/gc/cmd_mail_test.go` construct a simulated spawned session with full
-control of its own environment variables, `--from` claim, and mail
-content — including the exact env-strip shape
-(`GC_SESSION_ID`/`GC_ALIAS`/`GC_AGENT` all cleared) that defeated the
-env-var gate above — but with **no private key ever provisioned into its
-`GC_HOME`**, exactly the state a spawned session is in by construction
-(the orchestrator never puts the operator's private key into a session's
-environment or working directory). Every attempt to produce a verified
-message is refused
-(`TestCmdMailSendSignCannotForgeVerificationWithoutTrustKey`), and a
-hand-crafted bead carrying fabricated `mail.verified_*` metadata (simulating
+`internal/humantrust/humantrust_test.go` proves the crypto and the new
+envelope/public-key-only primitives in isolation (`TestEnvelopeRoundTrip`,
+`TestEnvelopeVerifiesAgainstOnlyThePublicKey`,
+`TestWritePublicKeyOnlyNeverTouchesPrivateKeyPath`). The core adversarial
+proof is `cmd/gc/cmd_mail_trust_relay_test.go`'s
+`TestSpawnedSessionCannotForgeVerifiedMailWhenPrivateKeyNeverTouchesItsNode`,
+which — learning from the first version's mistake — does not merely point a
+process at a different `GC_HOME`. It provisions two genuinely separate home
+directories with no shared filesystem (one holding a real keypair, standing
+in for the operator's machine; one holding only an imported public key,
+standing in for a node that runs the gascity orchestrator and every spawned
+session), walks every file under the target directory and proves from actual
+bytes on disk that the private key is not merely unreachable but genuinely,
+exhaustively absent, then runs the real compiled `gc` binary as a **separate
+OS process** — not an in-process function call — with the env-strip bypass
+shape (`GC_SESSION_ID`/`GC_ALIAS`/`GC_AGENT` never set) attempting both
+`mail send --sign` and `mail trust sign`. Both fail, and no message is
+created. The same test then proves the replacement flow's positive case in
+the same run: a signature produced by a process that legitimately holds the
+key, relayed via `mail send --signed-envelope` into a third process
+representing the target node, verifies correctly — and the private key still
+never touches that node's filesystem, checked again after the relay
+succeeds. `TestBeadToMessageNeverTrustsHandCraftedVerifiedMetadata` (a
+hand-crafted bead carrying fabricated `mail.verified_*` metadata, simulating
 a session with direct store-write access forging the fields `SendSigned`
-would have set, without the private key) never verifies
-(`TestBeadToMessageNeverTrustsHandCraftedVerifiedMetadata`). The positive
-case — a process with no managed-session identity and a genuinely
-provisioned key succeeds and reads back verified — is proven by
-`TestCmdMailSendSignSucceedsFromGenuineUnmanagedTerminal` and
-`TestSendSignedVerifiesOnReadWithGenuineKey`. Tampering with a genuinely
-signed message's body after the fact un-verifies it on the next read
-(`TestBeadToMessageRejectsTamperedContentAfterGenuineSigning`), proving
-verification is recomputed from live content, not cached.
+would have set, without ever holding the private key) never verifies.
+`TestBeadToMessageRejectsTamperedContentAfterGenuineSigning` proves tampering
+with a genuinely signed message's body after the fact un-verifies it on the
+next read, so verification is recomputed from live content, not cached.
 
 **What this does NOT prove — read this before relying on it.**
 
-- **No privilege separation on this host.** gascity has no separation
-  between the orchestrator process and a spawned session's process: both run
-  as the same OS user with no setuid, container, or namespace boundary
-  (confirmed by reading `internal/session/lifecycle.go` and
-  `internal/runtime/tmux`; session env is curated via `tmux -e` flags rather
-  than inherited wholesale, but the spawned process is still a plain child of
-  the same user's tmux server). This mechanism defeats a session
-  manipulating its **own environment variables, CLI flags, or mail content**
-  — the exact incident and the documented env-strip bypass — but it does
-  **not** defend against a session that goes further and directly reads
-  arbitrary files as that same OS user. If a session discovers the private
-  key's path and that path is readable by its own UID (which it is, absent
-  privilege separation), it can read the raw key exactly as it could already
-  read `internal/convergence`'s controller token — a pre-existing,
-  separately acknowledged gap (see the comment in `cmd/gc/controller.go`
-  about keeping that token out of `os.Environ()`). Closing this residual
-  risk needs real privilege separation (a different OS user or container
-  boundary for spawned sessions, or a signing daemon reachable only over an
-  authenticated channel a session cannot open) — infrastructure that does
-  not exist in gascity today. Do not describe this mechanism as immune to a
-  same-user filesystem adversary; it is not.
+- **Enforcement that the key stays off session-spawning nodes is
+  operational, not automatic.** Nothing in `gc mail trust init` or `gc mail
+  trust sign` can detect "this machine also runs the gascity orchestrator"
+  in general. An operator who runs `gc mail trust init` directly on an
+  orchestrator node recreates the exact gap this redesign closes — the tool
+  can only warn about this in its help text, not prevent it. The empirical
+  guarantee the tests above provide is conditional on the private key
+  genuinely having been generated and kept only on a machine with no shared
+  filesystem with the target node, which is how gascity's real deployment
+  works today (an operator's own machine, or a CI/relay host, reaching a
+  node over SSH) — it is not a claim that gc prevents an operator from
+  misusing its own tooling.
+- **The public-key import step is trust-on-first-use.** Whoever has write
+  access to a verifying node's trust directory before (or instead of) a
+  legitimate `gc mail trust import` can plant their own public key, paired
+  with their own privately-held key, and their own self-signed mail then
+  verifies on that node exactly as if it were genuine. `gc mail trust
+  import` refuses to silently overwrite an existing public key without
+  `--force`, and `--expect-fingerprint` lets the command itself enforce an
+  out-of-band-confirmed fingerprint — but this is only as good as the
+  operator's diligence in actually comparing fingerprints over a separate
+  channel, every time a key is imported, not just once. If a node's
+  filesystem was already compromised before the operator ever ran `import`
+  on it, nothing here catches that.
+- **No privilege separation on this host, for anything other than the
+  trust key.** gascity has no separation between the orchestrator process
+  and a spawned session's process: both still run as the same OS user with
+  no setuid, container, or namespace boundary (confirmed by reading
+  `internal/session/lifecycle.go` and `internal/runtime/tmux`). This
+  redesign removes the *private signing key* specifically from that shared
+  filesystem; it does nothing for other same-host secrets. A session that
+  goes further and directly reads arbitrary files as that same OS user can
+  still read anything else readable by its UID — e.g.
+  `internal/convergence`'s controller token, a pre-existing, separately
+  acknowledged gap (see the comment in `cmd/gc/controller.go` about keeping
+  that token out of `os.Environ()`).
 - **Bounded validity window, not full replay protection.** A signature is
   only accepted within `internal/humantrust.MaxSignatureAge` (15 minutes) of
   its claimed issuance time, but there is no nonce or used-signature ledger:
   a genuinely valid, still-fresh signature can be replayed verbatim (same
-  identity/recipient/body/timestamp) within that window.
+  identity/recipient/body/timestamp) within that window. For the relay flow
+  specifically, this also bounds how long an operator has between running
+  `gc mail trust sign` and the relayed `gc mail send --signed-envelope`
+  actually reaching the target node — relay promptly.
 - **The subject/title line is not signed at all**, since beadmail can rewrite
   an empty subject into a truncated prefix of the body — put anything
   security-relevant in the body, not the subject.
-- **Single-machine trust model.** The public key lookup is local to the Gas
-  City home on this host. There is no built-in multi-host key distribution;
-  copying the `.pub` file to another host that needs to verify the same
-  operator's mail is a manual step (`gc mail trust show` prints the
-  fingerprint for out-of-band confirmation).
+- **The relay flow depends on the recipient resolving identically on both
+  machines.** `gc mail trust sign <to> ...` has no access to the target
+  node's live session store, so `<to>` must be the exact address the target
+  node will itself resolve the recipient to. If it resolves differently
+  there, `gc mail send --signed-envelope` fails closed with a clear mismatch
+  error (never a silently misdirected or silently-renamed-recipient
+  message) — but that means a misremembered alias produces a failed relay,
+  not a helpful auto-correction.
 - **Send scope: CLI `gc mail send` only.** `gc mail reply`, `gc handoff`, the
   `exec:` mail provider, and the HTTP API's `POST /v0/mail` send/reply paths
-  do not support `--sign` — only `internal/mail/beadmail` implements
-  `mail.SignedSender`. This is a deliberate, documented MVP scope, not an
-  oversight: the reply path's recipient is derived from the original
-  message rather than resolved the way `Send` resolves it, and extending
-  signing there needs its own signed-payload shape.
+  do not support `--sign`/`--signed-envelope` — only `internal/mail/beadmail`
+  implements `mail.SignedSender`. This is a deliberate, documented MVP
+  scope, not an oversight: the reply path's recipient is derived from the
+  original message rather than resolved the way `Send` resolves it, and
+  extending signing there needs its own signed-payload shape.
 - **Read scope: CLI + HTTP API list/get, not HTTP API send.** `Verified`/
   `VerifiedIdentity` round-trip through the generated HTTP client
   (`internal/api/genclient`, `internal/api/decode_mail.go`) so `gc mail check
@@ -224,10 +309,18 @@ verification is recomputed from live content, not cached.
   against the new key (the old signature, produced under the old key, cannot
   validate under the new public key). There is no multi-key/rotation-grace
   window.
+- **The operator's own key-holding machine is out of scope.** If that
+  machine itself is compromised, nothing in this design helps — a real
+  secret with real consequences if leaked is not a new problem this package
+  introduces, and defending the operator's own endpoint is outside gascity's
+  threat model to begin with.
 
 Do not describe the env-var gate as verifying who sent a message — it never
 does. Do describe `Message.Verified` as an actual cryptographic confirmation,
-scoped exactly as this section states.
+scoped exactly as this section states. Do describe the private key as never
+touching a node that spawns sessions **when the documented flow is
+followed** — not as something gc itself guarantees regardless of how an
+operator chooses to run it.
 
 ## Rules For Authors
 

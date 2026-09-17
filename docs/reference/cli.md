@@ -2576,6 +2576,14 @@ Use --to as an alternative to the positional &lt;to&gt; argument.
 Use -s/--subject for the summary line and -m/--message for the body text.
 Use --all to broadcast to all live sessions (excluding sender and "human").
 
+--sign requires this process itself to hold the operator's private trust
+key (see 'gc mail trust init') — meant only for a machine that does not run
+the gascity orchestrator or any spawned session. When the key instead lives
+on a separate machine (the normal case for a node that runs spawned
+sessions), sign there with 'gc mail trust sign' and relay the resulting
+token here with --signed-envelope; this process then never needs the
+private key at all.
+
 ```
 gc mail send [<to>] [<body>] [flags]
 ```
@@ -2590,6 +2598,7 @@ gc mail send --to mayor "Build is green"
 gc mail send human "Review needed for PR #42"
 gc mail send polecat "Priority task" --notify
 gc mail send --all "Status update: tests passing"
+gc mail send --signed-envelope "$(gc mail trust sign mayor 'approve the deploy')"
 ```
 
 | Flag | Type | Default | Description |
@@ -2599,7 +2608,8 @@ gc mail send --all "Status update: tests passing"
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | message body text |
 | `--notify` | bool |  | request a recipient turn (including a managed wake if not running), even with earlier unread mail |
-| `--sign` | bool |  | cryptographically sign this reserved-identity (human/controller) send with the operator-only trust key (see 'gc mail trust init'); refused when this process has a managed-session identity or no trust key is provisioned |
+| `--sign` | bool |  | cryptographically sign this reserved-identity (human/controller) send with the operator-only trust key THIS PROCESS HOLDS (see 'gc mail trust init'); refused when this process has a managed-session identity or no trust key is provisioned; for a node that does not hold the key, use --signed-envelope instead |
+| `--signed-envelope` | string |  | relay a pre-signed envelope from 'gc mail trust sign' (run on the key-holding machine); pass "-" to read the token from stdin; supplies identity/recipient/subject/body itself, so combine with nothing else |
 | `-s`, `--subject` | string |  | message subject line |
 | `--to` | string |  | recipient address (alternative to positional argument) |
 
@@ -2617,7 +2627,7 @@ gc mail thread <id> [flags]
 
 ## gc mail trust
 
-Manage the Ed25519 keypair that backs "gc mail send --sign".
+Manage the Ed25519 keypair that backs verified "human"/"controller" mail.
 
 The private key lets its holder produce a signature that "gc mail check
 --inject", "gc mail inbox", and any other mail reader can independently
@@ -2625,8 +2635,11 @@ confirm came from a genuine human operator (or an explicitly provisioned
 trusted relay) claiming the reserved "human" or "controller" sender identity
 — without that reader ever needing the private key itself.
 
-Run "gc mail trust init" once, directly in your own terminal, before using
---sign. Never run it from inside a managed agent session.
+Run "gc mail trust init" once, on your OWN machine — never on a node that
+runs the gascity orchestrator or any spawned session — before using "gc mail
+trust sign" or "gc mail send --sign". Then run "gc mail trust import" on
+every node that needs to verify your signed mail, including nodes that run
+spawned sessions: it only ever writes the public key.
 
 ```
 gc mail trust
@@ -2634,17 +2647,57 @@ gc mail trust
 
 | Subcommand | Description |
 |------------|-------------|
+| [gc mail trust import](#gc-mail-trust-import) | Provision a verifying node with the operator's public key |
 | [gc mail trust init](#gc-mail-trust-init) | Generate the operator-only signing keypair |
 | [gc mail trust show](#gc-mail-trust-show) | Print the public key and fingerprint |
+| [gc mail trust sign](#gc-mail-trust-sign) | Sign a mail payload for later relay into a target node |
+
+## gc mail trust import
+
+Write ONLY a public key to this node's trust directory.
+
+Run this on every node that needs to verify signed mail, including nodes
+that run the gascity orchestrator and spawned sessions: unlike "init", this
+command has no code path that creates, receives, writes, or otherwise needs
+the private key, so running it here does not reintroduce the gap the key
+redesign closes.
+
+Paste the exact base64 value "gc mail trust show" printed on the machine
+that holds the private key. Refuses to overwrite an existing public key
+unless --force is given, since replacing a node's trusted key is a
+trust-changing operation.
+
+Pass --expect-fingerprint with the fingerprint you confirmed out-of-band
+(over a channel other than the one the key blob traveled over) to make this
+command itself refuse a mismatch, rather than relying only on a manual
+comparison afterward. This does not eliminate the risk of a pre-planted key
+if this node's filesystem was already compromised before you ran this
+command — it only catches a key blob that was tampered with, or a wrong
+key pasted, in this one step.
+
+```
+gc mail trust import <base64-public-key> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--expect-fingerprint` | string |  | refuse unless the imported key's fingerprint matches this out-of-band-confirmed value |
+| `--force` | bool |  | replace an existing trusted public key |
 
 ## gc mail trust init
 
-Generate a new Ed25519 keypair for "gc mail send --sign".
+Generate a new Ed25519 keypair for verified "human"/"controller" mail.
 
-The private key is written with mode 0600 to a machine-local, Gas-City-home
-path (see internal/gchome) that ordinary session commands never read. The
-public key is written alongside it, world-readable by design — sharing it
-does not let anyone forge a signature.
+Run this ONLY on your own machine, or an explicitly provisioned trusted
+relay machine — never on a node that runs the gascity orchestrator or any
+spawned session. The private key is written with mode 0600 to a
+machine-local, Gas-City-home path (see internal/gchome). Nothing about this
+command's own execution enforces "the right machine": that is an operator
+deployment decision this command cannot verify, only warn about.
+
+The public key is written alongside it, world-readable by design. Copy it to
+every node that needs to verify your signed mail with "gc mail trust show"
+and "gc mail trust import" — never by copying the private key file itself.
 
 Refuses to run when this process carries a managed-session identity
 (GC_SESSION_ID, GC_ALIAS, or GC_AGENT set): this command must be run by a
@@ -2668,9 +2721,63 @@ Print the currently provisioned public key and its fingerprint.
 Safe to run from anywhere, including inside a spawned session: it only
 reveals the public key, which does not let its reader forge a signature.
 
+Copy the base64 public key this prints and pass it to "gc mail trust
+import" on every node that needs to verify your signed mail. After
+importing, compare the fingerprint "gc mail trust import" (or a follow-up
+"gc mail trust show" on that node) reports against the fingerprint printed
+here — over a channel other than the one the key blob traveled over — to
+catch a pre-planted or substituted key.
+
 ```
 gc mail trust show
 ```
+
+## gc mail trust sign
+
+Sign a mail payload without sending it, producing a portable envelope.
+
+Run this ONLY on the machine that holds the private key — your own machine,
+or an explicitly provisioned trusted relay — never on a node that runs the
+gascity orchestrator or any spawned session (see "gc mail trust init"'s same
+constraint; the private key is loaded here exactly as it is there).
+
+&lt;to&gt; must be the exact address the TARGET node will resolve the recipient
+to (typically a plain session alias, e.g. "mayor"): the signature covers the
+identity, recipient, and body exactly as given, and the target node's
+"gc mail send --signed-envelope" recomputes the same resolution before
+verifying, so a recipient string that resolves differently there than it
+would have here makes the relay fail closed with a clear error, not a
+silent mismatch.
+
+Prints ONLY the opaque envelope token to stdout (safe to capture into a
+shell variable or pipe straight into an SSH command); explanatory text goes
+to stderr. Relay it with:
+
+  gc mail trust sign mayor "approve the deploy" | ssh node-c gc mail send --signed-envelope -
+
+or capture it first:
+
+  token=$(gc mail trust sign mayor "approve the deploy")
+  ssh node-c gc mail send --signed-envelope "$token"
+
+The target node never needs, loads, or receives the private key to accept
+this — it re-verifies the signature using only the public key already
+provisioned there via "gc mail trust import".
+
+Refuses to run when this process carries a managed-session identity, and
+refuses when no trust key is provisioned (run "gc mail trust init" first).
+The envelope is only valid for internal/humantrust.MaxSignatureAge (15
+minutes) from the moment this command runs — relay it promptly.
+
+```
+gc mail trust sign <to> <body> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--from` | string | `human` | reserved identity to sign as ("human" or "controller") |
+| `-m`, `--message` | string |  | message body text (overrides the positional &lt;body&gt; if both are given) |
+| `-s`, `--subject` | string |  | message subject line (not covered by the signature) |
 
 ## gc maintenance
 

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -173,8 +174,14 @@ func TestWriteKeyPairRefusesOverwriteWithoutForce(t *testing.T) {
 // TestLoadKeyNotFound proves the honest failure mode: a process pointed at a
 // Gas City home with no provisioned trust key gets a clear ErrKeyNotFound,
 // not a silently-generated or zero-value key that could be mistaken for a
-// real one. This is the state a spawned session is in by construction: the
-// orchestrator never provisions a trust key into a session's own GC_HOME.
+// real one. This is only the basic empty-directory case — it does NOT by
+// itself model a spawned session's real GC_HOME, since a spawned session
+// shares the operator's actual $HOME/.gc rather than getting an empty one
+// (see the package doc's history of that exact overclaim). For the full
+// two-machine adversarial proof, including an exhaustive filesystem walk and
+// real subprocesses, see
+// TestSpawnedSessionCannotForgeVerifiedMailWhenPrivateKeyNeverTouchesItsNode
+// in cmd/gc/cmd_mail_trust_relay_test.go.
 func TestLoadKeyNotFound(t *testing.T) {
 	t.Setenv("GC_HOME", t.TempDir())
 	if _, err := LoadPrivateKey(); !errors.Is(err, ErrKeyNotFound) {
@@ -212,5 +219,171 @@ func TestPathsAreUnderTrustDir(t *testing.T) {
 	}
 	if !filepath.IsAbs(dir) {
 		t.Fatalf("TrustDir is not absolute: %s", dir)
+	}
+}
+
+func TestEnvelopeRoundTrip(t *testing.T) {
+	_, priv, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	issuedAt := time.Now()
+	env := BuildEnvelope(priv, "human", "mayor", "Deploy approval", "approve the deploy", issuedAt)
+	token, err := EncodeEnvelope(env)
+	if err != nil {
+		t.Fatalf("EncodeEnvelope: %v", err)
+	}
+	if !strings.HasPrefix(token, envelopeWireVersion+":") {
+		t.Fatalf("EncodeEnvelope token = %q, want prefix %q", token, envelopeWireVersion+":")
+	}
+	decoded, err := DecodeEnvelope(token)
+	if err != nil {
+		t.Fatalf("DecodeEnvelope: %v", err)
+	}
+	if decoded.Identity != env.Identity || decoded.To != env.To || decoded.Subject != env.Subject || decoded.Body != env.Body {
+		t.Fatalf("DecodeEnvelope round-trip mismatch: got %+v, want %+v", decoded, env)
+	}
+	if !decoded.IssuedAt.Equal(env.IssuedAt) {
+		t.Fatalf("DecodeEnvelope IssuedAt = %v, want %v", decoded.IssuedAt, env.IssuedAt)
+	}
+	if string(decoded.Signature) != string(env.Signature) {
+		t.Fatalf("DecodeEnvelope Signature mismatch")
+	}
+}
+
+// TestEnvelopeVerifiesAgainstOnlyThePublicKey proves the core property the
+// relay flow depends on: a process holding only the PUBLIC key (never the
+// private key that built the envelope) can independently confirm the
+// envelope's signature is genuine.
+func TestEnvelopeVerifiesAgainstOnlyThePublicKey(t *testing.T) {
+	pub, priv, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	issuedAt := time.Now()
+	env := BuildEnvelope(priv, "controller", "witness", "", "advisory only, no action needed", issuedAt)
+	token, err := EncodeEnvelope(env)
+	if err != nil {
+		t.Fatalf("EncodeEnvelope: %v", err)
+	}
+	decoded, err := DecodeEnvelope(token)
+	if err != nil {
+		t.Fatalf("DecodeEnvelope: %v", err)
+	}
+	// Note: priv is never referenced again below this line — verification
+	// uses only pub, decoded's own fields, and the recomputed canonical
+	// payload.
+	if !Verify(pub, decoded.Identity, decoded.To, decoded.Body, decoded.IssuedAt, decoded.Signature) {
+		t.Fatalf("Verify rejected a genuine envelope using only the public key")
+	}
+}
+
+func TestDecodeEnvelopeRejectsGarbage(t *testing.T) {
+	cases := []string{
+		"",
+		"not-an-envelope-at-all",
+		envelopeWireVersion + ":not-base64!!!",
+		envelopeWireVersion + ":" + "e30=", // base64("{}") — valid JSON, missing required fields
+	}
+	for _, tc := range cases {
+		if _, err := DecodeEnvelope(tc); err == nil {
+			t.Fatalf("DecodeEnvelope(%q) = nil error, want a decode failure", tc)
+		}
+	}
+}
+
+func TestDecodeEnvelopeRejectsTamperedSignatureLength(t *testing.T) {
+	_, priv, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	env := BuildEnvelope(priv, "human", "mayor", "", "body", time.Now())
+	env.Signature = env.Signature[:len(env.Signature)-1] // truncate by one byte
+	token, err := EncodeEnvelope(env)
+	if err != nil {
+		t.Fatalf("EncodeEnvelope: %v", err)
+	}
+	if _, err := DecodeEnvelope(token); err == nil {
+		t.Fatalf("DecodeEnvelope accepted a truncated signature")
+	}
+}
+
+// TestWritePublicKeyOnlyNeverTouchesPrivateKeyPath is the core guarantee
+// "gc mail trust import" depends on: writing a public key never creates,
+// requires, or is blocked by the private key file's absence.
+func TestWritePublicKeyOnlyNeverTouchesPrivateKeyPath(t *testing.T) {
+	t.Setenv("GC_HOME", t.TempDir())
+	pub, _, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	if err := WritePublicKeyOnly(pub, false); err != nil {
+		t.Fatalf("WritePublicKeyOnly: %v", err)
+	}
+	loaded, err := LoadPublicKey()
+	if err != nil {
+		t.Fatalf("LoadPublicKey: %v", err)
+	}
+	if !loaded.Equal(pub) {
+		t.Fatalf("loaded public key does not match the one imported")
+	}
+	if _, err := os.Stat(PrivateKeyPath()); !os.IsNotExist(err) {
+		t.Fatalf("WritePublicKeyOnly created a private key file (or Stat returned an unexpected error): %v", err)
+	}
+	if _, err := LoadPrivateKey(); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("LoadPrivateKey after WritePublicKeyOnly = %v, want ErrKeyNotFound", err)
+	}
+}
+
+func TestWritePublicKeyOnlyRefusesOverwriteWithoutForce(t *testing.T) {
+	t.Setenv("GC_HOME", t.TempDir())
+	pub1, _, _ := GenerateKeyPair()
+	if err := WritePublicKeyOnly(pub1, false); err != nil {
+		t.Fatalf("WritePublicKeyOnly (first): %v", err)
+	}
+	pub2, _, _ := GenerateKeyPair()
+	if err := WritePublicKeyOnly(pub2, false); err == nil {
+		t.Fatalf("WritePublicKeyOnly (second, no force) = nil error, want refusal")
+	}
+	loaded, err := LoadPublicKey()
+	if err != nil {
+		t.Fatalf("LoadPublicKey: %v", err)
+	}
+	if !loaded.Equal(pub1) {
+		t.Fatalf("public key was overwritten despite force=false")
+	}
+	if err := WritePublicKeyOnly(pub2, true); err != nil {
+		t.Fatalf("WritePublicKeyOnly (force=true): %v", err)
+	}
+	loaded, err = LoadPublicKey()
+	if err != nil {
+		t.Fatalf("LoadPublicKey after force replace: %v", err)
+	}
+	if !loaded.Equal(pub2) {
+		t.Fatalf("force=true did not replace the public key")
+	}
+}
+
+func TestParsePublicKeyStringRoundTrip(t *testing.T) {
+	pub, _, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	encoded := EncodePublicKeyString(pub)
+	parsed, err := ParsePublicKeyString(encoded)
+	if err != nil {
+		t.Fatalf("ParsePublicKeyString: %v", err)
+	}
+	if !parsed.Equal(pub) {
+		t.Fatalf("ParsePublicKeyString round-trip mismatch")
+	}
+}
+
+func TestParsePublicKeyStringRejectsGarbage(t *testing.T) {
+	cases := []string{"", "not-base64!!!", "dG9vLXNob3J0"} // "too-short" base64
+	for _, tc := range cases {
+		if _, err := ParsePublicKeyString(tc); err == nil {
+			t.Fatalf("ParsePublicKeyString(%q) = nil error, want a decode/length failure", tc)
+		}
 	}
 }

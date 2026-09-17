@@ -1689,6 +1689,7 @@ func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
 	var message string
 	var jsonOut bool
 	var sign bool
+	var signedEnvelope string
 	cmd := &cobra.Command{
 		Use:   "send [<to>] [<body>]",
 		Short: "Send a message to a session alias or human",
@@ -1709,17 +1710,26 @@ GC_SESSION_ID/GC_ALIAS/GC_AGENT before invoking gc is indistinguishable from
 an unmanaged shell and is not caught.
 Use --to as an alternative to the positional <to> argument.
 Use -s/--subject for the summary line and -m/--message for the body text.
-Use --all to broadcast to all live sessions (excluding sender and "human").`,
+Use --all to broadcast to all live sessions (excluding sender and "human").
+
+--sign requires this process itself to hold the operator's private trust
+key (see 'gc mail trust init') — meant only for a machine that does not run
+the gascity orchestrator or any spawned session. When the key instead lives
+on a separate machine (the normal case for a node that runs spawned
+sessions), sign there with 'gc mail trust sign' and relay the resulting
+token here with --signed-envelope; this process then never needs the
+private key at all.`,
 		Example: `  gc mail send mayor "Build is green"
   gc mail send mayor -s "Build is green"
   gc mail send myrig/witness -s "Need investigation" -m "Attach logs from the last failed run"
   gc mail send --to mayor "Build is green"
   gc mail send human "Review needed for PR #42"
   gc mail send polecat "Priority task" --notify
-  gc mail send --all "Status update: tests passing"`,
+  gc mail send --all "Status update: tests passing"
+  gc mail send --signed-envelope "$(gc mail trust sign mayor 'approve the deploy')"`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
-			code := cmdMailSendJSONWithSign(args, notify, all, from, to, subject, message, jsonOut, sign, stdout, stderr)
+			code := cmdMailSendJSONWithSign(args, notify, all, from, to, subject, message, jsonOut, sign, signedEnvelope, stdout, stderr)
 			if code != 0 {
 				return errExit
 			}
@@ -1735,8 +1745,10 @@ Use --all to broadcast to all live sessions (excluding sender and "human").`,
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "message subject line")
 	cmd.Flags().StringVarP(&message, "message", "m", "", "message body text")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSONL result")
-	cmd.Flags().BoolVar(&sign, "sign", false, "cryptographically sign this reserved-identity (human/controller) send with the operator-only trust key (see 'gc mail trust init'); refused when this process has a managed-session identity or no trust key is provisioned")
+	cmd.Flags().BoolVar(&sign, "sign", false, "cryptographically sign this reserved-identity (human/controller) send with the operator-only trust key THIS PROCESS HOLDS (see 'gc mail trust init'); refused when this process has a managed-session identity or no trust key is provisioned; for a node that does not hold the key, use --signed-envelope instead")
+	cmd.Flags().StringVar(&signedEnvelope, "signed-envelope", "", "relay a pre-signed envelope from 'gc mail trust sign' (run on the key-holding machine); pass \"-\" to read the token from stdin; supplies identity/recipient/subject/body itself, so combine with nothing else")
 	cmd.MarkFlagsMutuallyExclusive("to", "all")
+	cmd.MarkFlagsMutuallyExclusive("sign", "signed-envelope")
 	return cmd
 }
 
@@ -1960,20 +1972,40 @@ func cmdMailSend(args []string, notify bool, all bool, from string, to string, s
 }
 
 func cmdMailSendJSON(args []string, notify bool, all bool, from string, to string, subject string, message string, jsonOut bool, stdout, stderr io.Writer) int {
-	return cmdMailSendJSONWithSign(args, notify, all, from, to, subject, message, jsonOut, false, stdout, stderr)
+	return cmdMailSendJSONWithSign(args, notify, all, from, to, subject, message, jsonOut, false, "", stdout, stderr)
 }
 
-// cmdMailSendJSONWithSign is cmdMailSendJSON plus the --sign surface: when
-// sign is true, the send is refused unless (a) this process carries no
-// managed-session identity and (b) an operator trust key is loadable, and on
-// success the message is cryptographically bound to its sender identity,
-// recipient, and body via internal/humantrust — see prepareSignedSend.
-// sign=false (the default from cmdMailSendJSON/cmdMailSend) is byte-for-byte
-// the pre-existing, unsigned behavior.
-func cmdMailSendJSONWithSign(args []string, notify bool, all bool, from string, to string, subject string, message string, jsonOut bool, sign bool, stdout, stderr io.Writer) int {
+// cmdMailSendJSONWithSign is cmdMailSendJSON plus two mutually exclusive
+// verified-send surfaces:
+//
+//   - sign=true: this process itself loads the operator's private trust key
+//     (see prepareSignedSend) and signs on the spot. Only valid when this
+//     process genuinely holds that key — i.e. it is not running on a node
+//     that spawns gc sessions.
+//   - signedEnvelope != "": a signature produced elsewhere (by
+//     "gc mail trust sign", run on the key-holding machine) is decoded,
+//     locally re-verified against this node's already-provisioned PUBLIC
+//     key, and relayed into the store. This process never loads or needs
+//     the private key.
+//
+// Both produce a message cryptographically bound to its sender identity,
+// recipient, and body via internal/humantrust. Neither set (the default
+// from cmdMailSendJSON/cmdMailSend) is byte-for-byte the pre-existing,
+// unsigned behavior.
+func cmdMailSendJSONWithSign(args []string, notify bool, all bool, from string, to string, subject string, message string, jsonOut bool, sign bool, signedEnvelope string, stdout, stderr io.Writer) int {
 	if sign && all {
 		fmt.Fprintln(stderr, "gc mail send: --sign cannot be combined with --all (sign one addressed recipient at a time)") //nolint:errcheck // best-effort stderr
 		return 1
+	}
+	if signedEnvelope != "" {
+		if all {
+			fmt.Fprintln(stderr, "gc mail send: --signed-envelope cannot be combined with --all (relay one addressed recipient at a time)") //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if from != "" || to != "" || subject != "" || message != "" || len(args) > 0 {
+			fmt.Fprintln(stderr, "gc mail send: --signed-envelope supplies its own sender, recipient, subject, and body; combine it with nothing else (notify/json excepted)") //nolint:errcheck // best-effort stderr
+			return 1
+		}
 	}
 	mp, code := openCityMailProvider(stderr, "gc mail send")
 	if mp == nil {
@@ -2014,6 +2046,19 @@ func cmdMailSendJSONWithSign(args []string, notify bool, all bool, from string, 
 			fmt.Fprintf(stderr, "gc mail send: listing live sessions: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
+	}
+
+	// --signed-envelope carries its own identity, recipient, subject, and
+	// body (validated above to be the ONLY addressing info given), so it
+	// branches out here before ordinary sender resolution and
+	// refuseUnauthenticatedHumanSender: its authenticity comes from a
+	// cryptographic signature this node independently re-verifies against
+	// its own provisioned public key (see doMailSendEnvelopeJSON), not from
+	// an environment-based claim, so the env-var gate does not apply and
+	// this process never needs the private key.
+	if signedEnvelope != "" {
+		rec := openCityRecorder(stderr)
+		return doMailSendEnvelopeJSON(mp, rec, validRecipients, cityPath, cfg, sessStore, idCache, signedEnvelope, notify, jsonOut, stdout, stderr)
 	}
 
 	sender := from
@@ -2259,6 +2304,110 @@ func doMailSendSignedJSON(mp mail.Provider, rec events.Recorder, validRecipients
 	notified := false
 	if nudgeFn != nil && to != "human" {
 		if err := nudgeFn(to, m.ID); err != nil {
+			fmt.Fprintf(stderr, "gc mail send: nudge failed: %v\n", err) //nolint:errcheck // best-effort stderr
+		} else {
+			notified = true
+		}
+	}
+	if jsonOut {
+		summary := summarizeMailMessage(m)
+		return writeCLIJSONLineOrExit(stdout, stderr, "gc mail send", mailActionResult{SchemaVersion: "1", OK: true, Command: "mail.send", Action: "send", ID: m.ID, Message: &summary, Messages: []mailMessageSummary{summary}, Count: intRef(1), Notified: notified})
+	}
+	return 0
+}
+
+// doMailSendEnvelopeJSON is the --signed-envelope counterpart to
+// doMailSendSignedJSON: instead of this process loading the private key and
+// signing on the spot, it decodes a signature produced elsewhere (by
+// "gc mail trust sign", run on the machine that actually holds the key) and
+// relays it in. This process never loads or needs the private key — only
+// the public key already provisioned here via "gc mail trust import".
+//
+// The recipient is re-resolved through the same alias-canonicalization
+// pipeline an ordinary send uses, then the signature is re-verified against
+// the resolved recipient (not the envelope's raw one) before anything is
+// written: if the signer's <to> does not resolve identically here, this
+// fails closed with a clear mismatch error rather than either silently
+// storing an unverifiable message or silently renaming the recipient the
+// signer authenticated. A message is only ever written once this process
+// has independently confirmed — using no secret, only the local public
+// key — that the signature is genuinely valid for the message's exact,
+// final content.
+func doMailSendEnvelopeJSON(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, cityPath string, cfg *config.City, sessStore beads.Store, idCache *mailIdentitySessionCache, envelopeToken string, notify bool, jsonOut bool, stdout, stderr io.Writer) int {
+	if envelopeToken == "-" {
+		raw, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc mail send: --signed-envelope -: reading stdin: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		envelopeToken = strings.TrimSpace(string(raw))
+	}
+	env, err := humantrust.DecodeEnvelope(envelopeToken)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc mail send: --signed-envelope: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if !isReservedMailIdentity(env.Identity) {
+		fmt.Fprintf(stderr, "gc mail send: --signed-envelope: identity %q is not a reserved identity (%s or %s)\n", env.Identity, mail.ReservedIdentityHuman, mail.ReservedIdentityController) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+
+	to := env.To
+	if sessStore != nil {
+		canonicalTo, err := resolveMailRecipientIdentityCached(cityPath, cfg, sessStore, env.To, idCache)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc mail send: --signed-envelope: unknown recipient %q: %v\n", env.To, err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		to = canonicalTo
+	}
+	if validRecipients != nil && !validRecipients[to] {
+		fmt.Fprintf(stderr, "gc mail send: --signed-envelope: unknown recipient %q\n", to) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+
+	pub, err := humantrust.LoadPublicKey()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc mail send: --signed-envelope: %v; run 'gc mail trust import' on this node first\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if !humantrust.Verify(pub, env.Identity, to, env.Body, env.IssuedAt, env.Signature) {
+		fmt.Fprintf(stderr, "gc mail send: --signed-envelope: signature does not verify for resolved recipient %q (signed for %q); sign using the exact recipient this node resolves to, relay within %s, and confirm this node's trusted public key matches the signer's (see 'gc mail trust show')\n", to, env.To, humantrust.MaxSignatureAge) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+
+	m, supported, err := mail.SendSigned(mp, env.Identity, to, env.Subject, env.Body, env.Signature, env.IssuedAt)
+	telemetry.RecordMailOp(context.Background(), "send", err)
+	if !supported {
+		fmt.Fprintf(stderr, "gc mail send: --signed-envelope is not supported by the configured mail provider (%q); only the built-in store-backed provider supports verified sends today\n", mailProviderName()) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if !m.Verified {
+		// Should be unreachable — the pre-check above already confirmed the
+		// signature verifies against the exact content being stored — but
+		// fail loudly rather than report a signed relay succeeded when the
+		// read side would disagree.
+		fmt.Fprintln(stderr, "gc mail send: --signed-envelope: provider reported success but the created message does not verify; refusing to report a signed send") //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	rec.Record(events.Event{
+		Type:    events.MailSent,
+		Actor:   m.From,
+		Subject: m.ID,
+		Message: to,
+		Payload: mailEventPayload(&m),
+	})
+	if !jsonOut {
+		fmt.Fprintf(stdout, "Sent verified message %s to %s (signed as %s, relayed)\n", m.ID, to, m.VerifiedIdentity) //nolint:errcheck // best-effort stdout
+	}
+
+	notified := false
+	if notify && to != "human" {
+		if err := newMailNudgeFunc(env.Identity)(to, m.ID); err != nil {
 			fmt.Fprintf(stderr, "gc mail send: nudge failed: %v\n", err) //nolint:errcheck // best-effort stderr
 		} else {
 			notified = true
