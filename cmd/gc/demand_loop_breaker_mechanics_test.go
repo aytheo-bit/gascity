@@ -629,4 +629,27 @@ func TestWithholdingNeverTouchesASessionThatExists(t *testing.T) {
 	if floors != 1 {
 		t.Errorf("a min_active_sessions floor seat was withheld by the breaker (%d left)", floors)
 	}
+
+	// A floor request that DOES carry a work bead must still be untouchable. The
+	// filter used to exclude floors only by implication — they carry no work
+	// bead today — which made the breaker's inability to suppress a
+	// min_active_sessions spawn a property of another file (kimi, 2026-09-18).
+	floored := []PoolDesiredState{{Template: agreementTemplate, Requests: []SessionRequest{
+		{Template: agreementTemplate, Tier: "new", FloorGuarantee: true, WorkBeadID: created.ID, WorkStoreRef: "city"},
+	}}}
+	chargeDemandSeatMints(floored, refusedWriteStore{Store: backing, err: errors.New("datastore unavailable")}, nil, demandLoopNow, io.Discard)
+	if len(floored[0].Requests) != 1 {
+		t.Fatal("a floor seat carrying a work bead was withheld: the breaker can suppress a min_active_sessions spawn")
+	}
+	healthyFloor := []PoolDesiredState{{Template: agreementTemplate, Requests: []SessionRequest{
+		{Template: agreementTemplate, Tier: "new", FloorGuarantee: true, WorkBeadID: created.ID, WorkStoreRef: "city"},
+	}}}
+	chargeDemandSeatMints(healthyFloor, backing, nil, demandLoopNow, io.Discard)
+	after, err := backing.Get(created.ID)
+	if err != nil {
+		t.Fatalf("re-reading: %v", err)
+	}
+	if raw := strings.TrimSpace(after.Metadata[beadmeta.DemandLoopStrikesMetadataKey]); raw != "" {
+		t.Errorf("a floor seat charged a strike against its work bead: %q", raw)
+	}
 }

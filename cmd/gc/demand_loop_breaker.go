@@ -211,7 +211,26 @@ func demandLoopFingerprint(b beads.Bead) string {
 //  3. demandLoopQuarantineRetry has elapsed since the last mint, so the row
 //     gets one probe seat. If it is still unclaimable that probe records another
 //     strike and pushes the next probe out another interval; if the cause
-//     cleared, the seat claims it and the row leaves the demand set for good.
+//     cleared, the seat claims it and the row leaves the demand set.
+//
+// RESIDUAL, and the sharpest thing the second review found (kimi, 2026-09-18).
+// "Leaves the demand set" is not "for good". Nothing records SUCCESS: a probe
+// that gets claimed sets an assignee, which moves the fingerprint and takes the
+// row out of demand — but if that work later reopens to the same shape, the
+// fingerprint comes back to the value the ledger was stamped with, the strikes
+// are still at or above the limit, and the row is throttled to one seat per
+// retry interval again. It is not stuck: an edit re-arms it, `gc doctor --fix`
+// clears it, and the doctor line names it (which is why that line no longer
+// asserts "none claimed" past the limit). But a row that has once tripped the
+// breaker and then genuinely recovered stays throttled until someone or
+// something touches it.
+//
+// Closing it properly means clearing the ledger from the CLAIM side, in `gc
+// hook --claim` — the other process, which is the only place a successful claim
+// is observable, and which the store already exists to connect. That is a
+// change to a second process with its own tests, and it is deliberately not in
+// this rework: the blast radius of this deploy is already the removal of a
+// pool-wide exemption and a new fail-closed path. Filed as the follow-up.
 //
 // A future-dated marker fails OPEN. A clock skew between the controller and a
 // seat, or a hand-edited timestamp, must not be able to park a row for as long
@@ -296,10 +315,14 @@ func nextDemandLoopLedger(b beads.Bead, now time.Time) demandLoopLedger {
 //
 // The caller's response is to WITHHOLD the seat (chargeDemandSeatMints), and
 // the reason that is the right response rather than a heavy-handed one is that
-// a claim is itself a write to this same store: a store that cannot take this
-// marker cannot take the assignee a claim sets either, so every seat minted
-// against it is an empty drain by construction. Not spending the seat costs
-// nothing that was going to happen anyway.
+// a claim is itself a write to this same store: a seat minted against a store
+// that is refusing writes has nothing to claim WITH. The second review is right
+// that this is a strong form of the argument rather than a proof — a metadata
+// batch and an assignee update are different write paths, and a store could in
+// principle gate one and not the other (kimi, 2026-09-18). The behaviour stands
+// on the weaker claim too: the alternative is reopening the critical finding,
+// and the cost of being wrong is one tick's seat for one row, retried on the
+// next tick.
 func noteDemandSeatMinted(store beads.Store, b beads.Bead, now time.Time, stderr io.Writer) error {
 	if store == nil {
 		return errDemandSeatNoStore
@@ -409,11 +432,12 @@ var (
 // have charged no strikes whatsoever.
 //
 // SECOND, the starvation case is narrower than it reads. Trigger rows are handed
-// out in the same Ready() order a worker's own query ranks (defaultScaleCheck
-// walks controllerDemandReady and allocates residual demand in that order), so a
-// charged row is by construction near the top of the ranking, and a row that
-// falls out of the top-N stops being handed seats and stops accruing strikes
-// altogether. A strike is also one SEAT, not one tick (an in-flight request
+// out in Ready() order — defaultScaleCheckCountsAndDemandAt walks
+// controllerDemandReady and allocateScaleDemandToConcrete binds residual demand
+// in that same order — which is the ordering a worker's own ready query uses,
+// give or take the staleness controllerDemandReady is documented to allow. So a
+// charged row is near the top of the ranking, and a row that falls out of the
+// top-N stops being handed seats and stops accruing strikes altogether. A strike is also one SEAT, not one tick (an in-flight request
 // carries its SessionBeadID and is skipped), so five strikes means five separate
 // sessions were minted for this row and none of them took it. Losing that race
 // five consecutive times requires higher-priority arrivals to outpace the pool's
@@ -438,6 +462,15 @@ func chargeDemandSeatMints(
 	now time.Time,
 	stderr io.Writer,
 ) {
+	// Both maps are keyed by the bare work bead ID, NOT by (store ref, ID), and
+	// that is deliberate rather than an oversight the second review caught
+	// (kimi, 2026-09-18, suggested adding the ref). The demand count one layer
+	// up dedups by bead ID ACROSS store groups on purpose — a rig store that
+	// aliases the city store surfaces the same rows twice, and countedBeads in
+	// build_desired_state.go exists to stop that doubling the template's demand.
+	// Keying the strike here by ref as well would charge such a row twice per
+	// tick and park it in two fifths of the intended time. One ID is one row is
+	// the contract the whole demand path already runs on.
 	charged := make(map[string]struct{})
 	withhold := make(map[string]struct{})
 	unaccountable := func(id, why string, err error) {
@@ -476,9 +509,25 @@ func chargeDemandSeatMints(
 
 // chargeableDemandSeatRequest reports whether this request represents a seat
 // the controller is spending on a row THIS tick — the only thing a strike may
-// be charged for.
+// be charged for, and therefore also the only thing the breaker may withhold.
+//
+// FloorGuarantee is rejected explicitly rather than by implication. A floor
+// request carries no work bead today, so the WorkBeadID test below already
+// excludes it — but that is a property of a construction site in another file,
+// and the whole point of the breaker is that it must not be able to suppress a
+// min_active_sessions spawn. Stating it here costs one line and does not depend
+// on that file staying the way it is (second review, kimi, 2026-09-18).
+//
+// RESIDUAL, stated rather than hidden: an anonymous new request can also carry
+// an EMPTY WorkBeadID when a pool's seat count exceeds the demand list it was
+// allocated from (pool_desired_state.go guards residualWorkBeadIDs by index).
+// Such a seat was not minted FOR a row, so there is no row to charge and none
+// to park. It is outside this breaker's unit of account, not a hole in it.
 func chargeableDemandSeatRequest(req SessionRequest) bool {
 	if req.Tier != "new" || strings.TrimSpace(req.SessionBeadID) != "" {
+		return false
+	}
+	if req.FloorGuarantee {
 		return false
 	}
 	return strings.TrimSpace(req.WorkBeadID) != ""
@@ -497,7 +546,14 @@ func withholdUnaccountableSeats(poolStates []PoolDesiredState, withhold map[stri
 		return
 	}
 	for i := range poolStates {
-		kept := poolStates[i].Requests[:0]
+		// A FRESH slice, not the `kept := s[:0]` filter-in-place idiom. The
+		// idiom is correct on its own terms, but it rewrites the backing array
+		// under anything else that still holds a slice over it, and this
+		// function runs in the middle of a long desired-state pass. The second
+		// review could not rule an aliasing holder out from the diff (kimi,
+		// 2026-09-18); an allocation on the rare tick where a store is refusing
+		// writes is not a price worth arguing about.
+		kept := make([]SessionRequest, 0, len(poolStates[i].Requests))
 		dropped := 0
 		for _, req := range poolStates[i].Requests {
 			if chargeableDemandSeatRequest(req) {
@@ -508,8 +564,11 @@ func withholdUnaccountableSeats(poolStates []PoolDesiredState, withhold map[stri
 			}
 			kept = append(kept, req)
 		}
+		if dropped == 0 {
+			continue
+		}
 		poolStates[i].Requests = kept
-		if dropped > 0 && stderr != nil {
+		if stderr != nil {
 			fmt.Fprintf(stderr, "demand loop breaker: %s: withheld %d unaccountable seat(s) this tick\n", poolStates[i].Template, dropped) //nolint:errcheck
 		}
 	}

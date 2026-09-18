@@ -65,6 +65,17 @@ func (q quarantinedDemandRow) describe() string {
 	if strings.TrimSpace(route) == "" {
 		route = "(no route)"
 	}
+	// "none claimed" is only true up to the strike limit. Past it, every extra
+	// strike is a PROBE, and a probe that was claimed is the outcome the retry
+	// window exists to produce — so a line that kept asserting nothing had ever
+	// been claimed would be telling an operator something the breaker does not
+	// know (second review, kimi, 2026-09-18). Above the limit the line reports
+	// what is actually true: seats keep being spent and the row keeps coming
+	// back unassigned.
+	if q.strikes > demandLoopStrikeLimit {
+		return fmt.Sprintf("%s bead %s %q routed to %s: %d seats minted, still unclaimed after %d probe(s) (%s) — counted only once per %s",
+			q.label, q.beadID, title, route, q.strikes, q.strikes-demandLoopStrikeLimit, q.reason, demandLoopQuarantineRetry)
+	}
 	return fmt.Sprintf("%s bead %s %q routed to %s: %d seats minted, none claimed (%s) — not counted as demand",
 		q.label, q.beadID, title, route, q.strikes, q.reason)
 }

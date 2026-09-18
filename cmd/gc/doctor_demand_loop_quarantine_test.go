@@ -164,3 +164,26 @@ var errUnreadableDemandLoopScope = &demandLoopTestError{"store is down"}
 type demandLoopTestError struct{ msg string }
 
 func (e *demandLoopTestError) Error() string { return e.msg }
+
+// TestDemandLoopQuarantineLineStopsClaimingNothingWasClaimed covers the
+// operator-facing half of the second review's D1 (kimi, 2026-09-18): past the
+// strike limit every further strike is a PROBE, and the check cannot know
+// whether a probe was claimed, so it must not keep asserting that none was.
+func TestDemandLoopQuarantineLineStopsClaimingNothingWasClaimed(t *testing.T) {
+	at := quarantinedDemandRow{
+		label: "city", beadID: "gc-1", title: "stuck", route: "rig/worker",
+		reason: demandLoopQuarantineReason, strikes: demandLoopStrikeLimit,
+	}
+	if got := at.describe(); !strings.Contains(got, "none claimed") {
+		t.Errorf("at the limit the line must still say none claimed: %q", got)
+	}
+	probed := at
+	probed.strikes = demandLoopStrikeLimit + 3
+	got := probed.describe()
+	if strings.Contains(got, "none claimed") {
+		t.Errorf("past the limit the line still asserts nothing was ever claimed, which the breaker cannot know: %q", got)
+	}
+	if !strings.Contains(got, "3 probe(s)") {
+		t.Errorf("past the limit the line must report the probes: %q", got)
+	}
+}
