@@ -22,6 +22,7 @@ var doctorCityStoreDependentNames = []string{
 	"census-owner-liveness",
 	"run-target-routed-to-backfill",
 	"route-recovery-quarantine",
+	"demand-loop-quarantine",
 	"hold-label-routed-to",
 	"pool-idle-routed-work",
 	"work-option-metadata-migration",
@@ -110,9 +111,14 @@ func TestBuildDoctorChecks_SkipsStoreChecksWhenStoreUnreachable(t *testing.T) {
 	if !strings.Contains(res.Message, "doltlite") {
 		t.Fatalf("preflight message = %q, want doltlite residual note", res.Message)
 	}
-	// Sixteen city checks plus three per active rig, two rigs active.
-	if !strings.Contains(res.Message, "skipped 22 store checks") {
-		t.Fatalf("preflight message = %q, want skip count 22", res.Message)
+	// Seventeen city checks plus three per active rig, two rigs active.
+	// The seventeenth is demand-loop-quarantine (OPS-78); this literal, the
+	// golden name-set, doctorCityStoreDependentNames and
+	// doctorCityStoreCheckCount are four hand-maintained censuses of the same
+	// register sites, and adding a store-dependent check means updating all
+	// four.
+	if !strings.Contains(res.Message, "skipped 23 store checks") {
+		t.Fatalf("preflight message = %q, want skip count 23", res.Message)
 	}
 	if !strings.Contains(res.Message, "2 rigs") {
 		t.Fatalf("preflight message = %q, want rig count 2", res.Message)
