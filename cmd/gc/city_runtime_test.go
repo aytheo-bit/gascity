@@ -946,14 +946,15 @@ func TestCityRuntimeDemandSnapshotRefreshesForNewRoutedReadyWork(t *testing.T) {
 	if got := first.result.PoolDesiredCounts[template]; got != 0 {
 		t.Fatalf("initial PoolDesiredCounts[%s] = %d, want 0", template, got)
 	}
-	if _, err := store.Create(beads.Bead{
+	routedWork, err := store.Create(beads.Bead{
 		Title:  "gap analysis",
 		Type:   "task",
 		Status: "open",
 		Metadata: map[string]string{
 			"gc.routed_to": template,
 		},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("Create routed work: %v", err)
 	}
 
@@ -965,12 +966,45 @@ func TestCityRuntimeDemandSnapshotRefreshesForNewRoutedReadyWork(t *testing.T) {
 		t.Fatalf("PoolDesiredCounts[%s] = %d, want 1 for newly-ready routed work", template, got)
 	}
 
+	// The tick that MINTS A SEAT is not a tick on which nothing changed: since
+	// OPS-78 the controller charges that seat against the row it was minted for,
+	// which is a write to the row, so the ready-demand fingerprint moves and the
+	// next patrol rebuilds. That is the ledger being on the bead, which is not
+	// an implementation detail — the two halves of the demand/claim loop are in
+	// different processes and the store is the only thing both of them see.
 	third := cr.loadDemandSnapshot(sessionBeads, nil, "patrol", false)
-	if buildCalls != 2 {
-		t.Fatalf("buildDesiredState call count = %d, want 2 after stable patrol reuse", buildCalls)
+	if buildCalls != 3 {
+		t.Fatalf("buildDesiredState call count = %d, want 3: the previous tick minted a seat and charged a demand-loop strike against the row, which moves the ready fingerprint", buildCalls)
 	}
 	if got := third.result.PoolDesiredCounts[template]; got != 1 {
 		t.Fatalf("cached PoolDesiredCounts[%s] = %d, want 1", template, got)
+	}
+
+	// And it must SETTLE. The bound that matters is that the breaker's
+	// bookkeeping cannot become a permanent per-tick rebuild. It cannot, because
+	// a strike is charged per SEAT, not per tick: the seat minted above now
+	// exists, so the next tick's request for this row carries its session bead
+	// and is not charged again, the row stops moving, and patrol reuse comes
+	// back on its own.
+	for i := 0; i < 4; i++ {
+		snap := cr.loadDemandSnapshot(sessionBeads, nil, "patrol", false)
+		if got := snap.result.PoolDesiredCounts[template]; got != 1 {
+			t.Fatalf("settle tick %d: PoolDesiredCounts[%s] = %d, want 1", i, template, got)
+		}
+	}
+	if buildCalls != 3 {
+		t.Fatalf("buildDesiredState call count = %d, want 3: four further patrol ticks must reuse the snapshot, because the strike is charged once per seat minted and not once per tick", buildCalls)
+	}
+	row, err := store.Get(routedWork.ID)
+	if err != nil {
+		t.Fatalf("re-reading the charged row: %v", err)
+	}
+	ledger, ok := parseDemandLoopLedger(row.Metadata[beadmeta.DemandLoopStrikesMetadataKey])
+	if !ok {
+		t.Fatalf("row %s carries no ledger — the rebuild above was not the breaker's write, so this test is measuring something else", row.ID)
+	}
+	if ledger.Strikes != 1 {
+		t.Fatalf("row %s accumulated %d strikes across %d patrol ticks; one seat was minted, so one strike is the whole budget", row.ID, ledger.Strikes, 7)
 	}
 }
 

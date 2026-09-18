@@ -133,20 +133,20 @@ func classifyDemandTrigger(triggerID, dir string, opts hookClaimOptions, ops hoo
 		// be. Settle it instead, against the same live deps the drain-ack open arm
 		// settles on.
 		return status, classifyDemandTriggerBlockedness(triggerID, dir, opts, ops)
-	default:
-		// Deferred: gated by defer_until (or bd's indefinite deferral), a fresh
-		// bead-local field, so draining past it is correct pull.
-		//
-		// Since OPS-78 this arm is unreachable from here, and that unreachability
-		// is the fix rather than dead code: demandRowServableAt now applies the
-		// same deferral exclusion above, on the same clock, so a deferred row
-		// short-circuits to benign before the switch. It is kept because it is
-		// the statement of what a deferred row means to this classifier, and
-		// because the two predicates agreeing is a property a test asserts
-		// (TestDemandCountsExactlyWhatTheClaimSideFindsClaimable) rather than
-		// something this switch may assume.
-		return status, events.DemandClaimBenign
 	}
+	// Every other classification is correct pull, and this is a catch-all for a
+	// classification nobody has added yet — not a deferred-row branch.
+	//
+	// It used to be a `default:` arm documented as the deferred case, kept after
+	// OPS-78 made it unreachable (demandRowServableAt now applies the same
+	// deferral exclusion above, on the same clock, so a deferred row returns
+	// benign before the switch). The review called that what it was: dead code
+	// preserved to satisfy a test (agy, 2026-09-17, finding 5). Deferral is
+	// stated once, in demand_serve_predicate.go, where the exclusion lives; the
+	// fall-through here earns its place only as the safe verdict for a
+	// demandRowClaimability value this function has not been taught, which is a
+	// property of the switch rather than a statement about deferral.
+	return status, events.DemandClaimBenign
 }
 
 // classifyDemandTriggerBlockedness settles a trigger row whose blockedness the

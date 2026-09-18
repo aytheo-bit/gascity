@@ -974,7 +974,13 @@ func buildDesiredStateWithSessionBeadsAt(
 		// demandLoopStrikeLimit seats without ever being claimed. Runs here
 		// rather than on the seat's own drain path because the drain is in
 		// another process and best-effort by design — see demand_loop_breaker.go.
-		recordDemandSeatMints(poolDesiredStates, store, rigStores, poolDecisionTime, stderr)
+		//
+		// Placement is load-bearing: this call MUTATES poolDesiredStates,
+		// withholding any not-yet-created seat whose strike the store refused,
+		// so it has to run before the create-budget allocator below sizes
+		// itself against the request list and before those requests are
+		// realized into sessions.
+		chargeDemandSeatMints(poolDesiredStates, store, rigStores, poolDecisionTime, stderr)
 		bp.configurePoolSessionCreateFairShare(poolDesiredStates)
 		for _, poolState := range poolDesiredStates {
 			cfgAgent := findAgentByTemplate(cfg, poolState.Template)
@@ -1899,27 +1905,24 @@ func defaultScaleCheckTargetForAgent(
 	return target
 }
 
-// defaultScaleCheckCounts reports ready, unassigned, routed work as fresh
-// generic pool demand. Assigned beads are handled by assigned-work collection
-// and named-session demand so they are intentionally excluded here. It has no
-// production caller that needs gc.routed_to instance-suffix normalization, so
-// it passes a nil cfg through to defaultScaleCheckCountsAndDemand; callers
-// that need normalization should call defaultScaleCheckCountsAndDemand
-// directly with a real *config.City.
-func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int, map[string]bool, []error) {
-	counts, _, partialTemplates, errs := defaultScaleCheckCountsAndDemandAt(nil, targets, time.Now())
-	return counts, partialTemplates, errs
-}
-
-func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCheckTarget, caches ...*readyDemandCache) (map[string]int, map[string]scaleCheckDemand, map[string]bool, []error) {
-	return defaultScaleCheckCountsAndDemandAt(cfg, targets, time.Now(), caches...)
-}
-
-// defaultScaleCheckCountsAndDemandAt is defaultScaleCheckCountsAndDemand with
-// the tick's clock supplied. The demand predicate's deferral and loop-breaker
-// exclusions are both answers about a moment, so the whole pass must read ONE
-// clock — the same poolDecisionTime the seats minted from this count are
-// charged against.
+// defaultScaleCheckCountsAndDemandAt reports ready, unassigned, routed work as
+// fresh generic pool demand, as of the caller's instant. Assigned beads are
+// handled by assigned-work collection and named-session demand, so they are
+// intentionally excluded here.
+//
+// There is no wall-clock wrapper over this in production, and that is the rule
+// rather than an omission: the demand predicate's deferral exclusion and the
+// loop breaker's retry window are both answers about a MOMENT, so one pass must
+// read one clock — the same poolDecisionTime the seats minted from this count
+// are charged against. A wrapper that called time.Now() would let a pass sample
+// the clock twice and reintroduce, at a smaller scale, exactly the
+// count-vs-claim disagreement OPS-78 is about. The two wrappers that used to
+// live here had no production caller at all; they are test helpers and now live
+// in build_desired_state_scale_check_helpers_test.go, where a test that does not
+// care which instant it reads can say so.
+//
+// A nil cfg skips gc.routed_to instance-suffix normalization; production passes
+// a real *config.City.
 func defaultScaleCheckCountsAndDemandAt(cfg *config.City, targets []defaultScaleCheckTarget, at time.Time, caches ...*readyDemandCache) (map[string]int, map[string]scaleCheckDemand, map[string]bool, []error) {
 	cache := optionalReadyDemandCache(caches)
 	counts := make(map[string]int, len(targets))

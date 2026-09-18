@@ -50,6 +50,7 @@ package main
 // would be the ninetieth event in forty minutes again.
 
 import (
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -283,13 +284,28 @@ func nextDemandLoopLedger(b beads.Bead, now time.Time) demandLoopLedger {
 // loop most expensive. The mint is in the controller, happens once per seat, and
 // is the event that actually costs the quota.
 //
-// Every write failure is logged and swallowed. A store that cannot take the
-// marker must not stop the controller reconciling; it degrades to the behaviour
-// that exists today, which is the loop, and the stderr line is how that is
-// visible.
-func noteDemandSeatMinted(store beads.Store, b beads.Bead, now time.Time, stderr io.Writer) {
-	if store == nil || strings.TrimSpace(b.ID) == "" {
-		return
+// A failure to record is RETURNED, never swallowed. This is the review finding
+// that had to be fixed rather than argued (agy, 2026-09-17): the first draft
+// logged the write error and carried on reconciling, so a store that had
+// degraded or was refusing writes accumulated no strikes at all and the breaker
+// was silently defeated — the loop running unbounded exactly when the system was
+// already unhealthy, which is the failure mode this file exists to prevent,
+// reintroduced through its own error path. A stderr line is not a fix; this
+// file's own header calls ninety unread events in forty minutes telemetry, not
+// a control, and a swallowed write error is the same thing one layer down.
+//
+// The caller's response is to WITHHOLD the seat (chargeDemandSeatMints), and
+// the reason that is the right response rather than a heavy-handed one is that
+// a claim is itself a write to this same store: a store that cannot take this
+// marker cannot take the assignee a claim sets either, so every seat minted
+// against it is an empty drain by construction. Not spending the seat costs
+// nothing that was going to happen anyway.
+func noteDemandSeatMinted(store beads.Store, b beads.Bead, now time.Time, stderr io.Writer) error {
+	if store == nil {
+		return errDemandSeatNoStore
+	}
+	if strings.TrimSpace(b.ID) == "" {
+		return errDemandSeatNoRow
 	}
 	ledger := nextDemandLoopLedger(b, now)
 	patch := map[string]string{beadmeta.DemandLoopStrikesMetadataKey: ledger.encode()}
@@ -308,10 +324,7 @@ func noteDemandSeatMinted(store beads.Store, b beads.Bead, now time.Time, stderr
 		patch[beadmeta.DemandLoopQuarantineReasonMetadataKey] = ""
 	}
 	if err := store.SetMetadataBatch(b.ID, patch); err != nil {
-		if stderr != nil {
-			fmt.Fprintf(stderr, "demand loop breaker: %s: recording seat mint: %v\n", b.ID, err) //nolint:errcheck
-		}
-		return
+		return fmt.Errorf("recording seat mint: %w", err)
 	}
 	if tripped && stderr != nil {
 		// Edge-triggered, once per streak, in the shape control.stalled uses.
@@ -319,6 +332,7 @@ func noteDemandSeatMinted(store beads.Store, b beads.Bead, now time.Time, stderr
 		fmt.Fprintf(stderr, "demand loop breaker: %s minted %d seats without ever being claimed — no longer counted as demand (gc doctor: demand-loop-quarantine)\n", //nolint:errcheck
 			b.ID, ledger.Strikes)
 	}
+	return nil
 }
 
 // clearDemandLoopLedger removes every trace of the breaker from a row. Used by
@@ -333,15 +347,34 @@ func clearDemandLoopLedger() map[string]string {
 	}
 }
 
-// recordDemandSeatMints charges every seat this tick minted on demand evidence
-// against the row that justified it.
+// errDemandSeatNoStore and errDemandSeatNoRow are the two ways a seat mint is
+// unaccountable before the store is even asked. They are errors rather than
+// silent returns for the same reason the write error is: an uncharged mint that
+// nobody hears about is the breaker's worst state.
+var (
+	errDemandSeatNoStore = errors.New("no store for the row this seat was minted on")
+	errDemandSeatNoRow   = errors.New("seat mint carries no work bead id")
+)
+
+// chargeDemandSeatMints charges every seat this tick minted on demand evidence
+// against the row that justified it, and WITHHOLDS any seat whose strike could
+// not be recorded.
 //
-// Only an ANONYMOUS NEW request counts. A protected or in-flight request is a
-// session that already exists — it was charged on the tick that created it, and
-// charging it again every tick it stays alive would quarantine rows that are
+// It mutates poolStates in place, which is why it must run before the desired
+// state is realized: a withheld request is a session that is never created.
+//
+// Only an ANONYMOUS NEW request is charged. A protected or in-flight request is
+// a session that already exists — it was charged on the tick that created it,
+// and charging it again every tick it stays alive would quarantine rows that are
 // being worked on perfectly well. That is the distinction between "the
 // controller spent a seat on this row" and "a seat that exists is pointed at
-// this row", and only the first one costs anything.
+// this row", and only the first one costs anything. It also makes a strike mean
+// one SEAT rather than one tick: five strikes is five separate sessions minted
+// for one row, not five ticks of one session.
+//
+// A floor-guarantee request carries no work bead and is therefore never charged
+// and never withheld: min_active_sessions is a promise about the pool, not a
+// claim about a row, and the breaker has no business touching it.
 //
 // Each charged row is READ BACK from its own store rather than looked up in one
 // of the tick's earlier snapshots. Deliberate, and worth the reads: the
@@ -353,7 +386,52 @@ func clearDemandLoopLedger() map[string]string {
 // bounded by the number of seats minted this tick (a pool's max, not the
 // backlog's depth), and a seat create is orders of magnitude more expensive than
 // a bead read.
-func recordDemandSeatMints(
+// WHY THERE IS NO POOL-WIDE EXEMPTION, and why the first landing had one.
+//
+// The first draft skipped charging EVERY row on a template whenever that
+// template had any non-"new" request — a session resuming or waking on assigned
+// work — on the argument that a pull pool's seat claims whatever its own query
+// ranks first, so a stable row can justify five seats, be outranked by all five,
+// and be parked while perfectly healthy. Starvation misread as unclaimability.
+// The review (agy, 2026-09-17) objected that one busy worker then disables the
+// breaker for every other unclaimable row on that template. That objection is
+// correct, and the exemption is gone. Three reasons, in order of weight.
+//
+// FIRST, the evidence did not support the inference. A resume or wake request
+// proves that a session which ALREADY EXISTS holds assigned work. It says
+// nothing about whether a NEWLY minted seat reaches anything — and it cannot,
+// because assigned rows are excluded from a worker's ready query (the serving
+// rules require unassigned), so they never compete with the new seats at all.
+// The signal is also a LEVEL, not an edge: it stays true for the whole life of
+// the resumed session, which on Node C is hours. A breaker that any long-lived
+// session switches off for its own template, for as long as it runs, is not a
+// conservative breaker; on the node and the window that produced OPS-78 it would
+// have charged no strikes whatsoever.
+//
+// SECOND, the starvation case is narrower than it reads. Trigger rows are handed
+// out in the same Ready() order a worker's own query ranks (defaultScaleCheck
+// walks controllerDemandReady and allocates residual demand in that order), so a
+// charged row is by construction near the top of the ranking, and a row that
+// falls out of the top-N stops being handed seats and stops accruing strikes
+// altogether. A strike is also one SEAT, not one tick (an in-flight request
+// carries its SessionBeadID and is skipped), so five strikes means five separate
+// sessions were minted for this row and none of them took it. Losing that race
+// five consecutive times requires higher-priority arrivals to outpace the pool's
+// seat count on five consecutive mints inside demandLoopStrikeWindow.
+//
+// THIRD, the residual false positive is bounded and self-clearing, which the
+// false negative is not. A wrongly parked row is probed again every
+// demandLoopQuarantineRetry, re-arms on the very next tick if anything about it
+// changes — including being claimed, which sets an assignee and moves the
+// fingerprint — and is named on stderr and in `gc doctor`. The cost is at worst
+// one seat of that pool's capacity per retry interval. A row parked wrongly is
+// ten minutes late; a loop left running is unbounded quota. Those are the two
+// asymmetries that matter, and this is which way they point once the exemption's
+// duration is priced in.
+//
+// What DOES survive, and is the correct unit, is the per-row guard inside the
+// loop: a row that already has a seat pointed at it is not charged again.
+func chargeDemandSeatMints(
 	poolStates []PoolDesiredState,
 	cityStore beads.Store,
 	rigStores map[string]beads.Store,
@@ -361,83 +439,80 @@ func recordDemandSeatMints(
 	stderr io.Writer,
 ) {
 	charged := make(map[string]struct{})
-	for _, state := range poolStates {
-		// A template whose pool is CLAIMING is not in a demand/claim loop, and
-		// none of its rows may take a strike this tick.
-		//
-		// Without this, the breaker punishes a row for the scheduler's
-		// behaviour. The controller hands each new seat a trigger row off the
-		// demand list, but the pool is PULL: the seat runs its own query and
-		// claims whatever that query ranks first, which under load is a
-		// higher-priority row that arrived later. A stable low-priority row can
-		// therefore justify five seats in a row, be passed over by all five
-		// because a sibling outranked it, and get parked while perfectly
-		// healthy — starvation misread as unclaimability.
-		//
-		// A non-"new" request is the evidence: ComputePoolDesiredStates mints
-		// "resume" and "wake-known-identity" tiers only from work that is
-		// actually ASSIGNED to this template. If any exist, seats are reaching
-		// work and the empty-drain loop is not what is happening here.
-		//
-		// The cost is a real false negative: a genuine loop row on a pool that
-		// is also doing useful work goes uncaught, and behaves as it does today.
-		// Taken deliberately. A false positive buries work an operator is
-		// waiting on; a false negative leaves in place a loop that has run
-		// unbounded for months. Those are not symmetric, and the first landing
-		// of a breaker should be the conservative one.
-		if poolStateHasAssignedWork(state) {
-			continue
+	withhold := make(map[string]struct{})
+	unaccountable := func(id, why string, err error) {
+		withhold[id] = struct{}{}
+		if stderr != nil {
+			fmt.Fprintf(stderr, "demand loop breaker: %s: %s: %v — seat withheld this tick (the store that cannot record a strike cannot record a claim either)\n", id, why, err) //nolint:errcheck
 		}
+	}
+	for _, state := range poolStates {
 		for _, req := range state.Requests {
-			if req.Tier != "new" || strings.TrimSpace(req.SessionBeadID) != "" {
+			if !chargeableDemandSeatRequest(req) {
 				continue
 			}
 			id := strings.TrimSpace(req.WorkBeadID)
-			if id == "" {
-				continue
-			}
 			if _, done := charged[id]; done {
 				continue
 			}
 			charged[id] = struct{}{}
 			store := demandLoopStoreForRef(req.WorkStoreRef, cityStore, rigStores)
 			if store == nil {
-				// Fail open and SAY SO. A silently uncharged mint is the
-				// breaker's worst state: the controller keeps minting seats for
-				// this row every tick, strikes never accumulate, and there is no
-				// error anywhere to explain why the loop this file exists to
-				// stop is running at full rate.
-				if stderr != nil {
-					fmt.Fprintf(stderr, "demand loop breaker: %s: no store for ref %q — seat mint not charged, this row cannot be parked\n", id, req.WorkStoreRef) //nolint:errcheck
-				}
+				unaccountable(id, fmt.Sprintf("no store for ref %q", req.WorkStoreRef), errDemandSeatNoStore)
 				continue
 			}
 			row, err := store.Get(id)
 			if err != nil {
-				// Same discipline: a store that cannot be read degrades to
-				// today's behaviour, which is the loop, and the line is how that
-				// is visible instead of silent.
-				if stderr != nil {
-					fmt.Fprintf(stderr, "demand loop breaker: %s: reading row to charge a seat mint: %v\n", id, err) //nolint:errcheck
-				}
+				unaccountable(id, "reading row to charge a seat mint", err)
 				continue
 			}
-			noteDemandSeatMinted(store, row, now, stderr)
+			if err := noteDemandSeatMinted(store, row, now, stderr); err != nil {
+				unaccountable(id, "charging a seat mint", err)
+			}
 		}
 	}
+	withholdUnaccountableSeats(poolStates, withhold, stderr)
 }
 
-// poolStateHasAssignedWork reports whether this template currently has work
-// assigned to it — a session resuming in-progress work, or one to be woken for
-// it. Both tiers are minted only from assigned rows, so either is proof the
-// pool's seats are reaching work.
-func poolStateHasAssignedWork(state PoolDesiredState) bool {
-	for _, req := range state.Requests {
-		if req.Tier != "new" {
-			return true
+// chargeableDemandSeatRequest reports whether this request represents a seat
+// the controller is spending on a row THIS tick — the only thing a strike may
+// be charged for.
+func chargeableDemandSeatRequest(req SessionRequest) bool {
+	if req.Tier != "new" || strings.TrimSpace(req.SessionBeadID) != "" {
+		return false
+	}
+	return strings.TrimSpace(req.WorkBeadID) != ""
+}
+
+// withholdUnaccountableSeats removes, from every pool, the not-yet-created
+// seats pointed at a row whose strike could not be recorded.
+//
+// It touches ONLY anonymous new requests. A resume or in-flight request is a
+// session that already exists, and withholding it would not save a seat — it
+// would stop one that is already running, turning a safety device into an
+// outage. The removal is per ROW, across every pool, because one row can
+// justify a seat on more than one template and the strike was charged once.
+func withholdUnaccountableSeats(poolStates []PoolDesiredState, withhold map[string]struct{}, stderr io.Writer) {
+	if len(withhold) == 0 {
+		return
+	}
+	for i := range poolStates {
+		kept := poolStates[i].Requests[:0]
+		dropped := 0
+		for _, req := range poolStates[i].Requests {
+			if chargeableDemandSeatRequest(req) {
+				if _, skip := withhold[strings.TrimSpace(req.WorkBeadID)]; skip {
+					dropped++
+					continue
+				}
+			}
+			kept = append(kept, req)
+		}
+		poolStates[i].Requests = kept
+		if dropped > 0 && stderr != nil {
+			fmt.Fprintf(stderr, "demand loop breaker: %s: withheld %d unaccountable seat(s) this tick\n", poolStates[i].Template, dropped) //nolint:errcheck
 		}
 	}
-	return false
 }
 
 // demandLoopStoreForRef resolves the store a demand row was counted in. An
