@@ -358,6 +358,19 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 		fmt.Fprintln(stderr, "gc hook --claim: assignee not specified (set $GC_SESSION_NAME or $GC_SESSION_ID)") //nolint:errcheck
 		return hookClaimResult{terminal: true, code: 1}
 	}
+	// A demand-started process carries the trigger captured at exec in its
+	// environment. The session bead's current trigger is NOT launch identity:
+	// reconciliation can clear or rebind it while this process is running. Use
+	// the frozen launch value so a later first-ready row cannot replace the
+	// issue that caused this process to start.
+	triggerID := ""
+	if hookClaimEnvValue(opts.Env, "GC_SPAWN_ORIGIN") == "demand" {
+		triggerID = strings.TrimSpace(hookClaimEnvValue(opts.Env, "GC_TRIGGER_BEAD_ID"))
+		if triggerID == "" {
+			fmt.Fprintln(stderr, "gc hook --claim: demand-started session has no launch trigger; refusing claim") //nolint:errcheck
+			return hookClaimResult{terminal: true, code: 1}
+		}
+	}
 	if ops.Runner == nil {
 		fmt.Fprintln(stderr, "gc hook --claim: missing work query runner") //nolint:errcheck
 		return hookClaimResult{terminal: true, code: 1}
@@ -452,6 +465,18 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 	}
 	if len(candidates) == 0 {
 		return hookClaimResult{}
+	}
+	if triggerID != "" {
+		bound := candidates[:0]
+		for _, candidate := range candidates {
+			if strings.TrimSpace(candidate.ID) == triggerID {
+				bound = append(bound, candidate)
+			}
+		}
+		candidates = bound
+		if len(candidates) == 0 {
+			return hookClaimResult{}
+		}
 	}
 
 	if result, bead, ok := hookClaimExistingAssignment(candidates, *opts); ok {
@@ -2062,10 +2087,10 @@ func hookEmitExecutionStepStarted(step beads.Bead, dir string, env []string, ass
 // It exists because a claimed step id is otherwise UNREACHABLE from the step's
 // own shell: GC_BEAD_ID is set only in the dispatch condition-script
 // environment (internal/convergence/condition.go), and GC_TRIGGER_BEAD_ID —
-// exported to demand-spawned pool seats as a pool-level spawn marker
-// (build_desired_state.go) — is absent on other seats and is a presence
-// signal, not a claim directive, so a formula step that must close the bead it
-// is running had no reliable way to name it and silently skipped its own close
+// exported to demand-spawned pool seats as a frozen launch binding
+// (build_desired_state.go) — is absent on other seats and cannot substitute for
+// the authoritative bead actually claimed, so a formula step that must close
+// the bead it is running had no reliable way to name it and silently skipped its own close
 // — work that did nothing reported green. `gc hook current` reads this stamp
 // back and closes that gap.
 //

@@ -1994,11 +1994,12 @@ The claim protocol stamps the claimed bead id onto the calling session's own
 bead, because the environment alone cannot reliably name it: $GC_BEAD_ID exists
 only in the controller's dispatch condition environment, never in a session
 shell, and $GC_TRIGGER_BEAD_ID — exported to demand-spawned pool seats as a
-pool-level spawn marker — is absent on other seats (e.g. a warm seat bound
-after start) and never decides what a session claims; the pool is pull. Named
-singleton sessions can carry a stale $GC_TRIGGER_BEAD_ID for their entire
-lifetime, pointing at a different bead than the one currently claimed, so it
-must never be consulted ahead of the claim. A formula step that must close
+launch binding — is absent on other seats (e.g. a warm seat bound after start).
+It constrains which bead a demand-started seat may claim, but is not proof of
+which bead it actually claimed. Named singleton sessions can carry a stale
+$GC_TRIGGER_BEAD_ID for their entire lifetime, pointing at a different bead
+than the one currently claimed, so it must never be consulted ahead of the
+claim receipt. A formula step that must close
 the bead it is running reads the stamp back here:
 
     BEAD_ID="$&#123;GC_BEAD_ID:-$(gc hook current --id-only)&#125;"

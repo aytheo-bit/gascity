@@ -736,6 +736,18 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 		if len(claimStore.env) > 0 {
 			storeOpts.Env = claimStore.env
 		}
+		// Store-specific query environments may replace the process environment.
+		// Keep the demand binding from the original hook invocation, regardless
+		// of which federated store supplied this candidate.
+		launchEnv := claimOpts.Env
+		if len(launchEnv) == 0 {
+			launchEnv = queryEnv
+		}
+		if hookClaimEnvValue(launchEnv, "GC_SPAWN_ORIGIN") == demandSpawnOriginValue {
+			storeOpts.Env = append(append([]string(nil), storeOpts.Env...),
+				"GC_SPAWN_ORIGIN="+demandSpawnOriginValue,
+				"GC_TRIGGER_BEAD_ID="+hookClaimEnvValue(launchEnv, "GC_TRIGGER_BEAD_ID"))
+		}
 		storeDir := workDir
 		if dir := strings.TrimSpace(claimStore.dir); dir != "" {
 			storeDir = dir
