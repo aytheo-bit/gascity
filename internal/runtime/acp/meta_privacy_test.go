@@ -7,9 +7,8 @@ import (
 	"testing"
 )
 
-// The ACP sidecar carries session identity and drain state. Unlike the herdr
-// and subprocess sidecars it is never seeded from the session environment, so
-// no API key lands here — but a reader can still impersonate the session and a
+// The ACP sidecar carries session identity and drain state. Only the three runtime ownership
+// fields are seeded from the session environment, so no API key lands here — but a reader can still impersonate the session and a
 // writer can forge a drain acknowledgement, and the default directory sat on a
 // path every user on the host shares.
 func TestSetMetaWritesOwnerOnlyFiles(t *testing.T) {

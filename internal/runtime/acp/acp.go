@@ -132,6 +132,28 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		return fmt.Errorf("%w: session %q", runtime.ErrSessionExists, name)
 	}
 
+	if err := runtime.EnsurePrivateDir(p.dir); err != nil {
+		p.mu.Unlock()
+		return fmt.Errorf("publishing session identity for %q: %w", name, err)
+	}
+
+	// Reconciler ownership probes use GetMeta, not the child environment.
+	// Publish only the identity fields before exposing the live reservation.
+	// Holding mu also keeps a duplicate start from replacing an owner's keys.
+	for _, key := range []string{"GC_SESSION_ID", "GC_INSTANCE_TOKEN", "GC_RUNTIME_EPOCH"} {
+		var err error
+		if value := cfg.Env[key]; value != "" {
+			err = p.SetMeta(name, key, value)
+		} else {
+			err = p.RemoveMeta(name, key)
+		}
+		if err != nil {
+			p.cleanupMeta(name)
+			p.mu.Unlock()
+			return fmt.Errorf("publishing session identity for %q: %w", name, err)
+		}
+	}
+
 	// Reserve the name with a sentinel so concurrent Start calls for the
 	// same name are rejected while we perform the slow handshake outside
 	// the lock. The sentinel's done channel is open (not closed), so
@@ -154,6 +176,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		if p.conns[name] == sentinel {
 			delete(p.conns, name)
 			delete(p.workDirs, name)
+			p.cleanupMeta(name)
 		}
 		p.mu.Unlock()
 	}
@@ -461,7 +484,7 @@ func (p *Provider) Stop(name string) error {
 
 	if ok {
 		if !sc.alive() {
-			p.cleanupMeta(name)
+			p.cleanupStoppedMeta(name)
 			return nil
 		}
 		// Guard against sentinel sessionConn (nil cmd/stdin during handshake).
@@ -470,12 +493,13 @@ func (p *Provider) Stop(name string) error {
 			if sc.cancel != nil {
 				sc.cancel()
 			}
+			p.cleanupStoppedMeta(name)
 			return nil
 		}
 		_ = sc.stdin.Close()
 		err := terminateProcess(sc)
 		if err == nil || runtime.IsSessionGone(err) {
-			p.cleanupMeta(name)
+			p.cleanupStoppedMeta(name)
 			return nil
 		}
 		return err
@@ -484,10 +508,20 @@ func (p *Provider) Stop(name string) error {
 	// Fall back to socket (cross-process case).
 	err := p.stopBySocket(name)
 	if err == nil || runtime.IsSessionGone(err) {
-		p.cleanupMeta(name)
+		p.cleanupStoppedMeta(name)
 		return nil
 	}
 	return err
+}
+
+// cleanupStoppedMeta preserves a replacement published while Stop waited for
+// the previous process or handshake to terminate.
+func (p *Provider) cleanupStoppedMeta(name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, replaced := p.conns[name]; !replaced {
+		p.cleanupMeta(name)
+	}
 }
 
 // Interrupt sends SIGINT to the named session's process.

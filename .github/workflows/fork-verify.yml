@@ -37,6 +37,8 @@ jobs:
           install-claude-cli: "false"
       - name: Build (compiles the whole tree — catches compile errors the macOS ICU break hides)
         run: go build ./...
+      - name: ACP identity and runtime routing regression
+        run: go test -race -tags integration ./internal/runtime/acp ./internal/runtime/auto ./internal/runtime/hybrid -count=1 -timeout=180s
       - name: Vet changed package
         run: go vet ./cmd/gc/...
       - name: Unit tests — cross-store work delivery
