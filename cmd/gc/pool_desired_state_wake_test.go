@@ -2,10 +2,67 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 )
+
+// TestComputePoolDesiredStates_FreshWakePreservesPostSuspendUserHold proves
+// that the generic pool demand pass retains a session explicitly suspended by
+// the user. The drain completion deliberately clears sleep_intent, leaving the
+// durable post-suspend shape as asleep + sleep_reason=user-hold + a future
+// held_until. A fresh-wake worker must not interpret that row as a stale asleep
+// holder and create a replacement for its still-in-progress work.
+func TestComputePoolDesiredStates_FreshWakePreservesPostSuspendUserHold(t *testing.T) {
+	const sessionID = "sess-user-held"
+	now := time.Date(2026, 9, 21, 16, 8, 0, 0, time.UTC)
+	agent := poolAgent("claude", "", intPtr(1), 0)
+	agent.WakeMode = "fresh"
+	cfg := &config.City{Agents: []config.Agent{agent}}
+
+	// This is the persisted state after gc session suspend drains the runtime:
+	// CompleteDrainPatch preserves the user-hold sleep reason and held_until,
+	// while clearing the transient sleep_intent marker.
+	held := poolSessionBeadWithState(sessionID, "asleep", "")
+	held.Metadata["sleep_reason"] = "user-hold"
+	held.Metadata["held_until"] = now.Add(time.Hour).Format(time.RFC3339)
+	held.Metadata["sleep_intent"] = ""
+	work := []beads.Bead{workBead("w1", "claude", sessionID, "in_progress", 2)}
+
+	result := ComputePoolDesiredStatesWithDemandTracedAt(
+		cfg, work, sessionInfosFromBeads([]beads.Bead{held}), nil, nil, now, nil,
+	)
+	if len(result) != 1 || len(result[0].Requests) != 1 {
+		t.Fatalf("pool demand requests = %#v, want exactly the held session resume", result)
+	}
+	req := result[0].Requests[0]
+	if req.Tier != "resume" || req.SessionBeadID != sessionID {
+		t.Fatalf("request = %#v, want resume of user-held session %q without a replacement", req, sessionID)
+	}
+	if req.WorkBeadID != work[0].ID || work[0].Status != "in_progress" || work[0].Assignee != sessionID {
+		t.Fatalf("assigned work changed or was detached: work=%#v request=%#v", work[0], req)
+	}
+
+	// Once the hold expires, the ordinary fresh-wake recovery rule applies
+	// again: a stopped session is stale and its work needs a clean replacement.
+	expired := held
+	expired.Metadata = make(map[string]string, len(held.Metadata))
+	for key, value := range held.Metadata {
+		expired.Metadata[key] = value
+	}
+	expired.Metadata["held_until"] = now.Add(-time.Hour).Format(time.RFC3339)
+	expiredResult := ComputePoolDesiredStatesWithDemandTracedAt(
+		cfg, work, sessionInfosFromBeads([]beads.Bead{expired}), nil, nil, now, nil,
+	)
+	if len(expiredResult) != 1 || len(expiredResult[0].Requests) != 1 {
+		t.Fatalf("expired-hold pool demand requests = %#v, want exactly one replacement", expiredResult)
+	}
+	expiredReq := expiredResult[0].Requests[0]
+	if expiredReq.Tier != "wake-known-identity" || expiredReq.SessionBeadID != "" {
+		t.Fatalf("expired-hold request = %#v, want clean replacement after the hold expires", expiredReq)
+	}
+}
 
 // closedPoolSessionBead creates a closed pool-managed session bead whose
 // template metadata matches the given qualified template name. Used to

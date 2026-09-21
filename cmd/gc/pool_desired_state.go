@@ -323,6 +323,13 @@ func computePoolDesiredStatesAt(
 	// wake_mode="fresh" agent must not resume one of these stale rows — see the
 	// resume-tier guard below.
 	asleepSessionBeadIDs := make(map[string]bool)
+	// userHeldAsleepSessionBeadIDs is the post-suspend subset of asleep rows.
+	// gc session suspend drains a running session, and drain completion clears
+	// sleep_intent while retaining the user-hold reason and its future hold. A
+	// fresh-wake agent must retain that concrete owner until the hold expires;
+	// otherwise its assigned work is re-homed onto a clean replacement despite
+	// the explicit operator hold.
+	userHeldAsleepSessionBeadIDs := make(map[string]bool)
 	for _, sb := range sessionInfos {
 		if sb.Closed {
 			continue
@@ -342,6 +349,10 @@ func computePoolDesiredStatesAt(
 		}
 		if sb.State == sessionpkg.StateAsleep {
 			asleepSessionBeadIDs[sb.ID] = true
+			if sb.SleepReason == string(sessionpkg.SleepReasonUserHold) &&
+				metadataTimeInFuture(sb.HeldUntil, decisionTime) {
+				userHeldAsleepSessionBeadIDs[sb.ID] = true
+			}
 		}
 	}
 
@@ -408,7 +419,8 @@ func computePoolDesiredStatesAt(
 				// already uses. A live (non-asleep) session still resumes;
 				// agents with unset or wake_mode="resume" are unaffected.
 				// (gastownhall/gascity#4849)
-				if agent.EffectiveWakeMode() == "fresh" && asleepSessionBeadIDs[sessionBeadID] {
+				if agent.EffectiveWakeMode() == "fresh" && asleepSessionBeadIDs[sessionBeadID] &&
+					!userHeldAsleepSessionBeadIDs[sessionBeadID] {
 					if _, ok := wakeRequestedTemplates[template]; ok {
 						continue
 					}
