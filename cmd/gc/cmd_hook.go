@@ -743,10 +743,11 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 		if len(launchEnv) == 0 {
 			launchEnv = queryEnv
 		}
-		if hookClaimEnvValue(launchEnv, "GC_SPAWN_ORIGIN") == demandSpawnOriginValue {
+		launchTrigger := hookClaimEnvValue(launchEnv, "GC_TRIGGER_BEAD_ID")
+		if hookClaimEnvValue(launchEnv, "GC_SPAWN_ORIGIN") == demandSpawnOriginValue && launchTrigger != "" {
 			storeOpts.Env = append(append([]string(nil), storeOpts.Env...),
 				"GC_SPAWN_ORIGIN="+demandSpawnOriginValue,
-				"GC_TRIGGER_BEAD_ID="+hookClaimEnvValue(launchEnv, "GC_TRIGGER_BEAD_ID"))
+				"GC_TRIGGER_BEAD_ID="+launchTrigger)
 		}
 		storeDir := workDir
 		if dir := strings.TrimSpace(claimStore.dir); dir != "" {
