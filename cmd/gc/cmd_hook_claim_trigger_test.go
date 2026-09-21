@@ -87,3 +87,23 @@ func TestFederatedHookClaimKeepsLaunchTriggerAcrossStoreEnvs(t *testing.T) {
 		t.Fatalf("claims = %v, want only launch trigger", rec.claims)
 	}
 }
+
+func TestFederatedHookClaimRefusesMissingLaunchTriggerDespiteStoreEnv(t *testing.T) {
+	rec := &turnBoundClaimRecorder{}
+	launchEnv := []string{"GC_SPAWN_ORIGIN=demand"}
+	stores := []hookStore{
+		{dir: "/city", env: []string{"GC_SPAWN_ORIGIN=demand", "GC_TRIGGER_BEAD_ID=work-other"}},
+	}
+	var stdout, stderr bytes.Buffer
+	code := claimHookWorkWithRunner("query", "/city", launchEnv, stores, hookClaimOptions{
+		Assignee:     "worker-1",
+		RouteTargets: []string{"worker"},
+		Env:          launchEnv,
+		JSON:         true,
+	}, rec.ops(t, triggerClaimCandidates), func(string, string, []string) (string, error) {
+		return triggerClaimCandidates, nil
+	}, func(string, error) {}, &stdout, &stderr)
+	if code == 0 || len(rec.claims) != 0 {
+		t.Fatalf("code=%d claims=%v, want refusal without store-trigger claim; stderr=%s", code, rec.claims, stderr.String())
+	}
+}
