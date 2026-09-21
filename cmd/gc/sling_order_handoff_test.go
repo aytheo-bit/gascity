@@ -15,19 +15,20 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
-// T-B: the production order, end to end, with NO by-id claim tier.
+// T-B: the production order, end to end, with no by-id claim tier.
 //
 // Tick 1 counts demand and realizes a seat; the seat's FIRST hook cycle
-// discovers and claims through the ordinary generated-query path. The seat knows
-// it was spawned from demand (GC_SPAWN_ORIGIN) and knows which row justified it
-// (GC_TRIGGER_WORK_BEAD_ID) — and neither may influence what it claims. The pool
-// is pull: the controller scales capacity, the worker chooses.
+// discovers and claims through the ordinary generated-query path. A demand
+// seat's launch trigger is immutable process identity: the controller may
+// rebind its session record, but the running worker must not claim that later
+// issue merely because it is the first row the query returns.
 
 // TestDemandSpawnedSeatClaimsThroughItsOwnQuery is the happy path the agreement
 // invariant is supposed to produce.
 func TestDemandSpawnedSeatClaimsThroughItsOwnQuery(t *testing.T) {
 	h := newHandoffFixture(t)
 	work := h.seedRoutedWork(t, "routed graph step")
+	h.triggerID = work.ID
 
 	result := h.runHook(t, h.workQueryServing(work))
 
@@ -56,12 +57,9 @@ func TestDemandSpawnedSeatClaimsThroughItsOwnQuery(t *testing.T) {
 	}
 }
 
-// THE anti-assignment control. The seat's trigger env names row X, but the query
-// serves row Y — and the seat claims Y. If any code path ever re-reads the
-// trigger id to decide what to claim, this row fails, which is exactly what the
-// operator ruling forbids: "the controller should never be assuming which bead
-// is picked up."
-func TestDemandSpawnedSeatClaimsWhatItsQueryServesNotItsTrigger(t *testing.T) {
+// A seat launched for X may not claim Y if X disappeared from its query. This
+// is the live Node C regression that a mutable session trigger exposed.
+func TestDemandSpawnedSeatRefusesDifferentReadyIssue(t *testing.T) {
 	h := newHandoffFixture(t)
 	trigger := h.seedRoutedWork(t, "the row the controller counted")
 	served := h.seedRoutedWork(t, "the row this seat's query served")
@@ -69,16 +67,22 @@ func TestDemandSpawnedSeatClaimsWhatItsQueryServesNotItsTrigger(t *testing.T) {
 
 	result := h.runHook(t, h.workQueryServing(served))
 
-	if result.BeadID != served.ID {
-		t.Fatalf("claimed %q, want the row the QUERY served (%q); the trigger id is demand bookkeeping, not an assignment",
-			result.BeadID, served.ID)
+	if result.Action != "drain" || result.Reason != hookClaimReasonNoWork {
+		t.Fatalf("result = %+v, want no-work drain when launch trigger is absent", result)
 	}
 	untouched, err := h.store.Get(trigger.ID)
 	if err != nil {
 		t.Fatalf("re-reading the trigger row: %v", err)
 	}
 	if strings.TrimSpace(untouched.Assignee) != "" {
-		t.Fatalf("the trigger row was claimed (assignee %q); nothing may claim by trigger id", untouched.Assignee)
+		t.Fatalf("the absent trigger was claimed (assignee %q)", untouched.Assignee)
+	}
+	other, err := h.store.Get(served.ID)
+	if err != nil {
+		t.Fatalf("re-reading the other ready row: %v", err)
+	}
+	if strings.TrimSpace(other.Assignee) != "" {
+		t.Fatalf("the other ready row was claimed (assignee %q)", other.Assignee)
 	}
 }
 
@@ -203,6 +207,7 @@ func (h *handoffFixture) env() []string {
 		"GC_SESSION_NAME=" + h.sessionName,
 		"GC_TEMPLATE=worker",
 		"GC_SPAWN_ORIGIN=demand",
+		"GC_TRIGGER_BEAD_ID=" + h.triggerID,
 		"GC_TRIGGER_WORK_BEAD_ID=" + h.triggerID,
 	}
 }

@@ -736,6 +736,26 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 		if len(claimStore.env) > 0 {
 			storeOpts.Env = claimStore.env
 		}
+		// Store-specific query environments may replace the process environment.
+		// Keep the demand binding from the original hook invocation, regardless
+		// of which federated store supplied this candidate.
+		launchEnv := claimOpts.Env
+		if len(launchEnv) == 0 {
+			launchEnv = queryEnv
+		}
+		launchOrigin := hookClaimEnvValue(launchEnv, "GC_SPAWN_ORIGIN")
+		launchTrigger := hookClaimEnvValue(launchEnv, "GC_TRIGGER_BEAD_ID")
+		if launchOrigin == demandSpawnOriginValue {
+			// The launch identity is authoritative. Remove any store-projected
+			// copies first so a store cannot override it (or reintroduce a
+			// trigger when the demand launch was malformed and the value is
+			// empty). The empty value remains intentional: tryHookClaim then
+			// refuses the malformed demand session before querying or claiming.
+			storeOpts.Env = hookClaimEnvWithoutKeys(storeOpts.Env, "GC_SPAWN_ORIGIN", "GC_TRIGGER_BEAD_ID")
+			storeOpts.Env = append(storeOpts.Env,
+				"GC_SPAWN_ORIGIN="+demandSpawnOriginValue,
+				"GC_TRIGGER_BEAD_ID="+launchTrigger)
+		}
 		storeDir := workDir
 		if dir := strings.TrimSpace(claimStore.dir); dir != "" {
 			storeDir = dir
@@ -758,6 +778,26 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 		remaining = removeHookStore(remaining, claimStore)
 	}
 	return writeHookClaimNoWork(claimOpts, ops, claimsErrored, workDir, stdout, stderr)
+}
+
+func hookClaimEnvWithoutKeys(env []string, keys ...string) []string {
+	filtered := make([]string, 0, len(env))
+	for _, entry := range env {
+		key, _, ok := strings.Cut(entry, "=")
+		blocked := false
+		if ok {
+			for _, blockedKey := range keys {
+				if key == blockedKey {
+					blocked = true
+					break
+				}
+			}
+		}
+		if !blocked {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }
 
 // Claim-read retry pacing. A work-query ERROR is a failed read, and the failures

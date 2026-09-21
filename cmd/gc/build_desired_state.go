@@ -3862,12 +3862,11 @@ func resolveTemplateForSessionBeadInfo(
 		if tp.Env == nil {
 			tp.Env = make(map[string]string)
 		}
-		// A POOL-LEVEL marker, presence only: this seat exists because the
-		// controller counted demand. Nothing on the claim path may read the
-		// trigger id to decide what to claim — the pool is pull, and the
-		// controller does not choose the bead — but a seat that drains no_work
-		// is worth telling apart from one started for any other reason, which is
-		// what the divergence diagnostics key on (demand_divergence.go).
+		// The process's launch identity: this seat exists because the controller
+		// counted demand for this bead. Reconciliation can later rebind the
+		// session record, so the hook uses this frozen environment value to keep
+		// the running seat on the issue that caused its start. A no-work drain
+		// also remains diagnosable through demand_divergence.go.
 		tp.Env["GC_SPAWN_ORIGIN"] = "demand"
 		tp.Env["GC_TRIGGER_BEAD_ID"] = triggerID
 		tp.Env["GC_TRIGGER_WORK_BEAD_ID"] = triggerID
